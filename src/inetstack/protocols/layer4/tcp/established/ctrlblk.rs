@@ -17,9 +17,10 @@ use crate::{
             SeqNumber,
         },
     },
-    runtime::network::socket::option::TcpSocketOptions,
+    runtime::{fail::Fail, network::socket::option::TcpSocketOptions},
 };
 use ::std::net::SocketAddrV4;
+use std::time::Instant;
 
 //======================================================================================================================
 // Structures
@@ -176,5 +177,35 @@ impl ControlBlock {
             flow_control,
             congestion_control,
         }
+    }
+
+    // Check the ACK bit.
+    pub fn check_and_process_ack(&mut self, header: &TcpHeader, now: Instant) -> Result<(), Fail> {
+        if !header.ack {
+            // All segments on established connections should be ACKs.  Drop this segment.
+            let cause = "Received non-ACK segment on established connection";
+            error!("{}", cause);
+            return Err(Fail::new(libc::EBADMSG, cause));
+        }
+
+        // TODO: RFC 5961 "Blind Data Injection Attack" prevention would have us perform additional ACK validation
+        // checks here.
+
+        self.process_ack(header, now);
+
+        Ok(())
+    }
+
+    // Processing of ACK is done here since all 4 module's state must be updated on ACK ingress
+    pub fn process_ack(&mut self, header: &TcpHeader, now: Instant) {
+        // Check and update send window if necessary.
+        self.flow_control.update_send_window(header);
+        self.congestion_control
+            .process_samples_on_ack(&self.delivery, header, now);
+        self.connection_management
+            .process_multiple_acked_fins(&self.delivery, header);
+        self.delivery
+            .sender
+            .update_on_ack(&self.congestion_control, header, now);
     }
 }

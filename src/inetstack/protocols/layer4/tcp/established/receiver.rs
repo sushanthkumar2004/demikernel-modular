@@ -195,7 +195,7 @@ impl Receiver {
         )?;
         Self::check_and_process_rst(control_block, &header)?;
         Self::check_syn(&header)?;
-        Self::check_and_process_ack(control_block, &header, now)?;
+        control_block.check_and_process_ack(&header, now)?;
 
         // TODO: Check the URG bit.  If we decide to support this, how should we do it?
         if header.urg {
@@ -532,23 +532,6 @@ impl Receiver {
             // TODO: Start the close coroutine
             return Err(Fail::new(libc::EBADMSG, cause));
         }
-        Ok(())
-    }
-
-    // Check the ACK bit.
-    fn check_and_process_ack(cb: &mut ControlBlock, header: &TcpHeader, now: Instant) -> Result<(), Fail> {
-        if !header.ack {
-            // All segments on established connections should be ACKs.  Drop this segment.
-            let cause = "Received non-ACK segment on established connection";
-            error!("{}", cause);
-            return Err(Fail::new(libc::EBADMSG, cause));
-        }
-
-        // TODO: RFC 5961 "Blind Data Injection Attack" prevention would have us perform additional ACK validation
-        // checks here.
-
-        Sender::process_ack(cb, header, now);
-
         Ok(())
     }
 
