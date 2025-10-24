@@ -858,7 +858,14 @@ impl OrderedDeliveryState {
         // Store whether the packet has data here because processing it will consume the DemiBuffer.
         let has_data = !data.is_empty();
         if has_data {
-            Self::process_data(control_block, layer3_endpoint, data, seg_start, seg_end, seg_len)?;
+            control_block.delivery.process_data(
+                &control_block.connection_management,
+                layer3_endpoint,
+                data,
+                seg_start,
+                seg_end,
+                seg_len,
+            )?;
         }
         // Deal with FIN flag, saving the FIN for later if it is out of order.
         Self::check_and_process_fin(control_block, &header, seg_end, layer3_endpoint)?;
@@ -1199,7 +1206,7 @@ impl OrderedDeliveryState {
         Ok(())
     }
 
-    fn process_incoming_data(
+    fn process_data(
         &mut self,
         connection_management: &ConnectionManagementState,
         layer3_endpoint: &mut SharedLayer3Endpoint,
@@ -1238,24 +1245,6 @@ impl OrderedDeliveryState {
 
         // We're done with this out-of-order segment.
         Ok(())
-    }
-
-    fn process_data(
-        cb: &mut ControlBlock,
-        layer3_endpoint: &mut SharedLayer3Endpoint,
-        data: DemiBuffer,
-        seg_start: SeqNumber,
-        seg_end: SeqNumber,
-        seg_len: u32,
-    ) -> Result<(), Fail> {
-        cb.delivery.process_incoming_data(
-            &cb.connection_management,
-            layer3_endpoint,
-            data,
-            seg_start,
-            seg_end,
-            seg_len,
-        )
     }
 
     // This routine takes an incoming TCP segment and adds it to the out-of-order receive queue.
