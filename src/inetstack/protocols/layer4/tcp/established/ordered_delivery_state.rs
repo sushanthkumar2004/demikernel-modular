@@ -19,6 +19,7 @@ use crate::{
             layer3::SharedLayer3Endpoint,
             layer4::tcp::{
                 established::{
+                    connection_management_state::ConnectionManagementState,
                     ctrlblk::{ControlBlock, State},
                     MAX_WINDOW_SIZE_WITHOUT_SCALING, MAX_WINDOW_SIZE_WITH_SCALING,
                 },
@@ -315,9 +316,12 @@ impl OrderedDeliveryState {
     fn send_fin(cb: &mut ControlBlock, layer3_endpoint: &mut SharedLayer3Endpoint, now: Instant) -> Result<(), Fail> {
         debug_assert!(cb.delivery.sender_fin_seq_no.is_some());
 
-        let mut header = Self::tcp_header(cb, cb.delivery.sender_fin_seq_no);
+        let mut header = cb
+            .delivery
+            .tcp_header(&cb.connection_management, cb.delivery.sender_fin_seq_no);
         header.fin = true;
-        Self::emit(cb, layer3_endpoint, header, None);
+        cb.delivery
+            .emit(&cb.connection_management, layer3_endpoint, header, None);
         // Update SND.NXT.
         cb.delivery.send_next_seq_no.modify(|s| s + 1.into());
 
@@ -400,8 +404,9 @@ impl OrderedDeliveryState {
         let mut win_sz_watched = cb.flow_control.send_window.clone();
         loop {
             // Create packet.
-            let header = Self::tcp_header(cb, None);
-            Self::emit(cb, layer3_endpoint, header, Some(probe.clone()));
+            let header = cb.delivery.tcp_header(&cb.connection_management, None);
+            cb.delivery
+                .emit(&cb.connection_management, layer3_endpoint, header, Some(probe.clone()));
 
             match win_sz_watched.wait_for_change(Some(timeout)).await {
                 Ok(_) => return Ok(()),
@@ -454,11 +459,16 @@ impl OrderedDeliveryState {
         );
 
         // Prepare the segment and send it.
-        let mut header = Self::tcp_header(cb, None);
+        let mut header = cb.delivery.tcp_header(&cb.connection_management, None);
         if do_push {
             header.psh = true;
         }
-        Self::emit(cb, layer3_endpoint, header, Some(segment_data.clone()));
+        cb.delivery.emit(
+            &cb.connection_management,
+            layer3_endpoint,
+            header,
+            Some(segment_data.clone()),
+        );
 
         // Update SND.NXT.
         cb.delivery
@@ -491,17 +501,18 @@ impl OrderedDeliveryState {
     /// Fetch a TCP header filling out various values based on our current state.
     /// If a sequence number is provided, use it otherwise, use the current unsent sequence number.
     /// The only time that the unsent sequence number is not used is when we are retransmitting.
-    pub fn tcp_header(cb: &mut ControlBlock, seq_num: Option<SeqNumber>) -> TcpHeader {
-        let mut header = TcpHeader::new(
-            cb.connection_management.local.port(),
-            cb.connection_management.remote.port(),
-        );
-        header.window_size = cb.delivery.hdr_window_size();
+    pub fn tcp_header(
+        &self,
+        connection_management: &ConnectionManagementState,
+        seq_num: Option<SeqNumber>,
+    ) -> TcpHeader {
+        let mut header = TcpHeader::new(connection_management.local.port(), connection_management.remote.port());
+        header.window_size = self.hdr_window_size();
 
         // Note that once we reach a synchronized state we always include a valid acknowledgement number.
         header.ack = true;
-        header.ack_num = cb.delivery.receive_next_seq_no;
-        header.seq_num = seq_num.unwrap_or(cb.delivery.send_next_seq_no.get());
+        header.ack_num = self.receive_next_seq_no;
+        header.seq_num = seq_num.unwrap_or(self.send_next_seq_no.get());
 
         header
     }
@@ -617,7 +628,9 @@ impl OrderedDeliveryState {
 
             // TODO: Issue #198 Repacketization - we should send a full MSS (and set the FIN flag if applicable).
 
-            let mut header = Self::tcp_header(cb, Some(cb.delivery.send_unacked.get()));
+            let mut header = cb
+                .delivery
+                .tcp_header(&cb.connection_management, Some(cb.delivery.send_unacked.get()));
 
             if data.is_some() {
                 // Regular packet, so set the PSH flag.
@@ -627,7 +640,8 @@ impl OrderedDeliveryState {
                 header.fin = true;
             }
 
-            Self::emit(cb, layer3_endpoint, header, data);
+            cb.delivery
+                .emit(&cb.connection_management, layer3_endpoint, header, data);
         }
     }
 
@@ -689,14 +703,19 @@ impl OrderedDeliveryState {
     }
 
     /// Send an ACK to our peer, reflecting our current state.
-    pub fn send_ack(cb: &mut ControlBlock, layer3_endpoint: &mut SharedLayer3Endpoint) {
-        let header = Self::tcp_header(cb, None);
-        Self::emit(cb, layer3_endpoint, header, None);
+    pub fn send_ack(
+        &mut self,
+        connection_management: &ConnectionManagementState,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+    ) {
+        let header = self.tcp_header(connection_management, None);
+        self.emit(connection_management, layer3_endpoint, header, None);
     }
 
     /// Transmit this message to our connected peer.
     pub fn emit(
-        cb: &mut ControlBlock,
+        &mut self,
+        connection_management: &ConnectionManagementState,
         layer3_endpoint: &mut SharedLayer3Endpoint,
         header: TcpHeader,
         body: Option<DemiBuffer>,
@@ -706,7 +725,7 @@ impl OrderedDeliveryState {
             Some(body) => {
                 debug!(
                     "L4 OUTGOING {:?} Connection sending {} bytes + {:?}",
-                    cb.connection_management.state,
+                    connection_management.state,
                     body.len(),
                     header
                 );
@@ -715,7 +734,7 @@ impl OrderedDeliveryState {
             _ => {
                 debug!(
                     "L4 OUTGOING {:?} Connection sending 0 bytes + {:?}",
-                    cb.connection_management.state, header
+                    connection_management.state, header
                 );
                 DemiBuffer::new_with_headroom(0, MAX_HEADER_SIZE as u16)
             },
@@ -724,12 +743,12 @@ impl OrderedDeliveryState {
         // This routine should only ever be called to send TCP segments that contain a valid ACK value.
         debug_assert!(header.ack);
 
-        let remote_ipv4_addr = *cb.connection_management.remote.ip();
+        let remote_ipv4_addr = *connection_management.remote.ip();
         header.serialize_and_attach(
             &mut pkt,
-            cb.connection_management.local.ip(),
-            cb.connection_management.remote.ip(),
-            cb.connection_management.tcp_config.get_tx_checksum_offload(),
+            connection_management.local.ip(),
+            connection_management.remote.ip(),
+            connection_management.tcp_config.get_tx_checksum_offload(),
         );
 
         // Call lower L3 layer to send the segment.
@@ -742,7 +761,7 @@ impl OrderedDeliveryState {
         // Review: We perform these after the send, in order to keep send latency as low as possible.
 
         // Since we sent an ACK, cancel any outstanding delayed ACK request.
-        cb.delivery.ack_deadline_time_secs.set(None);
+        self.ack_deadline_time_secs.set(None);
     }
 
     //======================================================================================================================
@@ -854,7 +873,9 @@ impl OrderedDeliveryState {
             // We already owe our peer an ACK (the timer was already running), so cancel the timer and ACK now.
             control_block.delivery.ack_deadline_time_secs.set(None);
             trace!("process_packet(): sending ack before deadline because another packet arrived");
-            Self::send_ack(control_block, layer3_endpoint);
+            control_block
+                .delivery
+                .send_ack(&control_block.connection_management, layer3_endpoint);
         }
 
         Ok(())
@@ -912,7 +933,7 @@ impl OrderedDeliveryState {
 
         // Have we processed all of the data and the FIN?
         if header.fin {
-            Self::send_ack(cb, layer3_endpoint);
+            cb.delivery.send_ack(&cb.connection_management, layer3_endpoint);
         }
 
         Ok(())
@@ -1049,7 +1070,7 @@ impl OrderedDeliveryState {
                     // This is an entirely duplicate (i.e. old) segment.  ACK (if not RST) and drop.
                     if !header.rst {
                         trace!("check_segment_in_window(): send ack on duplicate segment");
-                        Self::send_ack(cb, layer3_endpoint);
+                        cb.delivery.send_ack(&cb.connection_management, layer3_endpoint);
                     }
                     let cause = "duplicate packet";
                     error!("check_segment_in_window(): {}", cause);
@@ -1076,7 +1097,7 @@ impl OrderedDeliveryState {
                     // This segment is completely outside of our window.  ACK (if not RST) and drop.
                     if !header.rst {
                         trace!("check_segment_in_window(): send ack on out-of-window segment");
-                        Self::send_ack(cb, layer3_endpoint);
+                        cb.delivery.send_ack(&cb.connection_management, layer3_endpoint);
                     }
                     let cause = "packet outside of receive window";
                     error!("check_segment_in_window(): {}", cause);
@@ -1178,8 +1199,9 @@ impl OrderedDeliveryState {
         Ok(())
     }
 
-    fn process_data(
-        cb: &mut ControlBlock,
+    fn process_incoming_data(
+        &mut self,
+        connection_management: &ConnectionManagementState,
         layer3_endpoint: &mut SharedLayer3Endpoint,
         data: DemiBuffer,
         seg_start: SeqNumber,
@@ -1187,7 +1209,7 @@ impl OrderedDeliveryState {
         seg_len: u32,
     ) -> Result<(), Fail> {
         // TCP dictates that we only receive data in these states.
-        match cb.connection_management.state {
+        match connection_management.state {
             State::Established | State::FinWait1 | State::FinWait2 => (),
             state => {
                 warn!("Ignoring data received after FIN (in state {:?}).", state);
@@ -1196,8 +1218,8 @@ impl OrderedDeliveryState {
         };
 
         // Data is in order, so directly receive.
-        if seg_start == cb.delivery.receive_next_seq_no {
-            cb.delivery.receive_data(seg_start, data);
+        if seg_start == self.receive_next_seq_no {
+            self.receive_data(seg_start, data);
             return Ok(());
         }
 
@@ -1205,17 +1227,35 @@ impl OrderedDeliveryState {
         // after the "hole" in the sequence number space has been filled.
         debug!(
             "Received out-of-order segment; out_of_order_frames.len() = {:?}",
-            cb.delivery.out_of_order_frames.len()
+            self.out_of_order_frames.len()
         );
         debug_assert_ne!(seg_len, 0);
         debug_assert_eq!(seg_len, data.len() as u32);
-        cb.delivery.store_out_of_order_segment(seg_start, seg_end, data);
+        self.store_out_of_order_segment(seg_start, seg_end, data);
         // Sending an ACK here is only a "MAY" according to the RFCs, but helpful for fast retransmit.
         trace!("process_data(): send ack on out-of-order segment");
-        Self::send_ack(cb, layer3_endpoint);
+        self.send_ack(connection_management, layer3_endpoint);
 
         // We're done with this out-of-order segment.
         Ok(())
+    }
+
+    fn process_data(
+        cb: &mut ControlBlock,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+        data: DemiBuffer,
+        seg_start: SeqNumber,
+        seg_end: SeqNumber,
+        seg_len: u32,
+    ) -> Result<(), Fail> {
+        cb.delivery.process_incoming_data(
+            &cb.connection_management,
+            layer3_endpoint,
+            data,
+            seg_start,
+            seg_end,
+            seg_len,
+        )
     }
 
     // This routine takes an incoming TCP segment and adds it to the out-of-order receive queue.
@@ -1340,7 +1380,7 @@ impl OrderedDeliveryState {
                     continue;
                 },
                 Err(Fail { errno, cause: _ }) if errno == libc::ETIMEDOUT => {
-                    Self::send_ack(cb, layer3_endpoint);
+                    cb.delivery.send_ack(&cb.connection_management, layer3_endpoint);
                     deadline = ack_deadline.get();
                 },
                 Err(_) => {
