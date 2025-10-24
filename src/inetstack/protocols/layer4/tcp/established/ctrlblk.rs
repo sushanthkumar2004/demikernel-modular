@@ -8,9 +8,13 @@
 use crate::{
     inetstack::{
         config::TcpConfig,
-        protocols::layer4::tcp::established::{
-            congestion_control_state::CongestionControlState, delivery_state::DeliveryState,
-            flow_control_state::FlowControlState,
+        protocols::layer4::tcp::{
+            established::{
+                congestion_control_state::CongestionControlState, delivery_state::DeliveryState,
+                flow_control_state::FlowControlState,
+            },
+            header::TcpHeader,
+            SeqNumber,
         },
     },
     runtime::network::socket::option::TcpSocketOptions,
@@ -97,5 +101,24 @@ impl ControlBlock {
             flow_control,
             congestion_control,
         }
+    }
+
+    /// Fetch a TCP header filling out various values based on our current state.
+    /// If a sequence number is provided, use it otherwise, use the current unsent sequence number.
+    /// The only time that the unsent sequence number is not used is when we are retransmitting.
+    pub fn tcp_header(
+        connection_management: &ConnectionManagementState,
+        delivery_state: &DeliveryState,
+        seq_num: Option<SeqNumber>,
+    ) -> TcpHeader {
+        let mut header = TcpHeader::new(connection_management.local.port(), connection_management.remote.port());
+        header.window_size = delivery_state.receiver.hdr_window_size();
+
+        // Note that once we reach a synchronized state we always include a valid acknowledgement number.
+        header.ack = true;
+        header.ack_num = delivery_state.receiver.receive_next_seq_no;
+        header.seq_num = seq_num.unwrap_or(delivery_state.sender.send_next_seq_no.get());
+
+        header
     }
 }

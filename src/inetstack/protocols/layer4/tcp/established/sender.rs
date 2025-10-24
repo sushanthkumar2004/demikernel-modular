@@ -8,7 +8,7 @@
 use crate::{
     collections::{async_queue::SharedAsyncQueue, async_value::SharedAsyncValue},
     inetstack::{
-        consts::{MAX_BATCH_SIZE_NUM_PACKETS, MAX_HEADER_SIZE},
+        consts::MAX_BATCH_SIZE_NUM_PACKETS,
         protocols::{
             layer3::SharedLayer3Endpoint,
             layer4::tcp::{
@@ -247,9 +247,11 @@ impl Sender {
     fn send_fin(cb: &mut ControlBlock, layer3_endpoint: &mut SharedLayer3Endpoint, now: Instant) -> Result<(), Fail> {
         debug_assert!(cb.delivery.sender.fin_seq_no.is_some());
 
-        let mut header = Self::tcp_header(cb, cb.delivery.sender.fin_seq_no);
+        let mut header =
+            ControlBlock::tcp_header(&cb.connection_management, &cb.delivery, cb.delivery.sender.fin_seq_no);
         header.fin = true;
-        Self::emit(cb, layer3_endpoint, header, None);
+        cb.delivery
+            .emit(&cb.connection_management, layer3_endpoint, header, None);
         // Update SND.NXT.
         cb.delivery.sender.send_next_seq_no.modify(|s| s + 1.into());
 
@@ -332,8 +334,9 @@ impl Sender {
         let mut win_sz_watched = cb.flow_control.send_window.clone();
         loop {
             // Create packet.
-            let header = Self::tcp_header(cb, None);
-            Self::emit(cb, layer3_endpoint, header, Some(probe.clone()));
+            let header = ControlBlock::tcp_header(&cb.connection_management, &cb.delivery, None);
+            cb.delivery
+                .emit(&cb.connection_management, layer3_endpoint, header, Some(probe.clone()));
 
             match win_sz_watched.wait_for_change(Some(timeout)).await {
                 Ok(_) => return Ok(()),
@@ -386,11 +389,16 @@ impl Sender {
         );
 
         // Prepare the segment and send it.
-        let mut header = Self::tcp_header(cb, None);
+        let mut header = ControlBlock::tcp_header(&cb.connection_management, &cb.delivery, None);
         if do_push {
             header.psh = true;
         }
-        Self::emit(cb, layer3_endpoint, header, Some(segment_data.clone()));
+        cb.delivery.emit(
+            &cb.connection_management,
+            layer3_endpoint,
+            header,
+            Some(segment_data.clone()),
+        );
 
         // Update SND.NXT.
         cb.delivery
@@ -419,24 +427,6 @@ impl Sender {
             cb.delivery.sender.retransmit_deadline_time_secs.set(Some(now + rto));
         }
         segment_data_len as usize
-    }
-
-    /// Fetch a TCP header filling out various values based on our current state.
-    /// If a sequence number is provided, use it otherwise, use the current unsent sequence number.
-    /// The only time that the unsent sequence number is not used is when we are retransmitting.
-    pub fn tcp_header(cb: &mut ControlBlock, seq_num: Option<SeqNumber>) -> TcpHeader {
-        let mut header = TcpHeader::new(
-            cb.connection_management.local.port(),
-            cb.connection_management.remote.port(),
-        );
-        header.window_size = cb.delivery.receiver.hdr_window_size();
-
-        // Note that once we reach a synchronized state we always include a valid acknowledgement number.
-        header.ack = true;
-        header.ack_num = cb.delivery.receiver.receive_next_seq_no;
-        header.seq_num = seq_num.unwrap_or(cb.delivery.sender.send_next_seq_no.get());
-
-        header
     }
 
     fn get_open_window_size_bytes(cb: &mut ControlBlock) -> usize {
@@ -550,7 +540,11 @@ impl Sender {
 
             // TODO: Issue #198 Repacketization - we should send a full MSS (and set the FIN flag if applicable).
 
-            let mut header = Self::tcp_header(cb, Some(cb.delivery.sender.send_unacked.get()));
+            let mut header = ControlBlock::tcp_header(
+                &cb.connection_management,
+                &cb.delivery,
+                Some(cb.delivery.sender.send_unacked.get()),
+            );
 
             if data.is_some() {
                 // Regular packet, so set the PSH flag.
@@ -560,7 +554,8 @@ impl Sender {
                 header.fin = true;
             }
 
-            Self::emit(cb, layer3_endpoint, header, data);
+            cb.delivery
+                .emit(&cb.connection_management, layer3_endpoint, header, data);
         }
     }
 
@@ -621,63 +616,6 @@ impl Sender {
                 cb.delivery.sender.unacked_queue.len()
             );
         }
-    }
-
-    /// Send an ACK to our peer, reflecting our current state.
-    pub fn send_ack(cb: &mut ControlBlock, layer3_endpoint: &mut SharedLayer3Endpoint) {
-        let header = Self::tcp_header(cb, None);
-        Self::emit(cb, layer3_endpoint, header, None);
-    }
-
-    /// Transmit this message to our connected peer.
-    pub fn emit(
-        cb: &mut ControlBlock,
-        layer3_endpoint: &mut SharedLayer3Endpoint,
-        header: TcpHeader,
-        body: Option<DemiBuffer>,
-    ) {
-        // Only perform this debug print in debug builds.  debug_assertions is compiler set in non-optimized builds.
-        let mut pkt = match body {
-            Some(body) => {
-                debug!(
-                    "L4 OUTGOING {:?} Connection sending {} bytes + {:?}",
-                    cb.connection_management.state,
-                    body.len(),
-                    header
-                );
-                body
-            },
-            _ => {
-                debug!(
-                    "L4 OUTGOING {:?} Connection sending 0 bytes + {:?}",
-                    cb.connection_management.state, header
-                );
-                DemiBuffer::new_with_headroom(0, MAX_HEADER_SIZE as u16)
-            },
-        };
-
-        // This routine should only ever be called to send TCP segments that contain a valid ACK value.
-        debug_assert!(header.ack);
-
-        let remote_ipv4_addr = *cb.connection_management.remote.ip();
-        header.serialize_and_attach(
-            &mut pkt,
-            cb.connection_management.local.ip(),
-            cb.connection_management.remote.ip(),
-            cb.connection_management.tcp_config.get_tx_checksum_offload(),
-        );
-
-        // Call lower L3 layer to send the segment.
-        if let Err(e) = layer3_endpoint.transmit_tcp_packet_nonblocking(remote_ipv4_addr, pkt) {
-            warn!("could not emit packet: {:?}", e);
-            return;
-        }
-
-        // Post-send operations follow.
-        // Review: We perform these after the send, in order to keep send latency as low as possible.
-
-        // Since we sent an ACK, cancel any outstanding delayed ACK request.
-        cb.delivery.receiver.ack_deadline_time_secs.set(None);
     }
 }
 //======================================================================================================================

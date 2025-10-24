@@ -87,7 +87,7 @@ pub struct Receiver {
     // Queue of out-of-order segments.  This is where we hold onto data that we've received (because it was within our
     // receive window) but can't yet present to the user because we're missing some other data that comes between this
     // and what we've already presented to the user.
-    out_of_order_frames: VecDeque<(SeqNumber, DemiBuffer)>,
+    pub(crate) out_of_order_frames: VecDeque<(SeqNumber, DemiBuffer)>,
 }
 
 //======================================================================================================================
@@ -224,7 +224,9 @@ impl Receiver {
             // We already owe our peer an ACK (the timer was already running), so cancel the timer and ACK now.
             control_block.delivery.receiver.ack_deadline_time_secs.set(None);
             trace!("process_packet(): sending ack before deadline because another packet arrived");
-            Sender::send_ack(control_block, layer3_endpoint);
+            control_block
+                .delivery
+                .send_ack(&control_block.connection_management, layer3_endpoint);
         }
 
         Ok(())
@@ -286,7 +288,7 @@ impl Receiver {
 
         // Have we processed all of the data and the FIN?
         if header.fin {
-            Sender::send_ack(cb, layer3_endpoint);
+            cb.delivery.send_ack(&cb.connection_management, layer3_endpoint);
         }
 
         Ok(())
@@ -326,7 +328,7 @@ impl Receiver {
     // be received, it receives that too.
     //
     // This routine also updates receive_next to reflect any data now considered "received".
-    fn receive_data(&mut self, seg_start: SeqNumber, buf: DemiBuffer) {
+    pub fn receive_data(&mut self, seg_start: SeqNumber, buf: DemiBuffer) {
         // This routine should only be called with in-order segment data.
         debug_assert_eq!(seg_start, self.receive_next_seq_no);
 
@@ -423,7 +425,7 @@ impl Receiver {
                     // This is an entirely duplicate (i.e. old) segment.  ACK (if not RST) and drop.
                     if !header.rst {
                         trace!("check_segment_in_window(): send ack on duplicate segment");
-                        Sender::send_ack(cb, layer3_endpoint);
+                        cb.delivery.send_ack(&cb.connection_management, layer3_endpoint);
                     }
                     let cause = "duplicate packet";
                     error!("check_segment_in_window(): {}", cause);
@@ -450,7 +452,7 @@ impl Receiver {
                     // This segment is completely outside of our window.  ACK (if not RST) and drop.
                     if !header.rst {
                         trace!("check_segment_in_window(): send ack on out-of-window segment");
-                        Sender::send_ack(cb, layer3_endpoint);
+                        cb.delivery.send_ack(&cb.connection_management, layer3_endpoint);
                     }
                     let cause = "packet outside of receive window";
                     error!("check_segment_in_window(): {}", cause);
@@ -560,45 +562,26 @@ impl Receiver {
         seg_end: SeqNumber,
         seg_len: u32,
     ) -> Result<(), Fail> {
-        // TCP dictates that we only receive data in these states.
-        match cb.connection_management.state {
-            State::Established | State::FinWait1 | State::FinWait2 => (),
-            state => {
-                warn!("Ignoring data received after FIN (in state {:?}).", state);
-                return Ok(());
-            },
-        };
-
-        // Data is in order, so directly receive.
-        if seg_start == cb.delivery.receiver.receive_next_seq_no {
-            cb.delivery.receiver.receive_data(seg_start, data);
-            return Ok(());
-        }
-
-        // This segment is out-of-order.  If it carries data, we should store it for later processing
-        // after the "hole" in the sequence number space has been filled.
-        debug!(
-            "Received out-of-order segment; out_of_order_frames.len() = {:?}",
-            cb.delivery.receiver.out_of_order_frames.len()
-        );
-        debug_assert_ne!(seg_len, 0);
-        debug_assert_eq!(seg_len, data.len() as u32);
-        cb.delivery
-            .receiver
-            .store_out_of_order_segment(seg_start, seg_end, data);
-        // Sending an ACK here is only a "MAY" according to the RFCs, but helpful for fast retransmit.
-        trace!("process_data(): send ack on out-of-order segment");
-        Sender::send_ack(cb, layer3_endpoint);
-
-        // We're done with this out-of-order segment.
-        Ok(())
+        cb.delivery.handle_data(
+            &cb.connection_management,
+            layer3_endpoint,
+            data,
+            seg_start,
+            seg_end,
+            seg_len,
+        )
     }
 
     // This routine takes an incoming TCP segment and adds it to the out-of-order receive queue.
     // If the new segment had a FIN it has been removed prior to this routine being called.
     // Note: Since this is not the "fast path", this is written for clarity over efficiency.
     //
-    fn store_out_of_order_segment(&mut self, mut new_start: SeqNumber, mut new_end: SeqNumber, mut buf: DemiBuffer) {
+    pub fn store_out_of_order_segment(
+        &mut self,
+        mut new_start: SeqNumber,
+        mut new_end: SeqNumber,
+        mut buf: DemiBuffer,
+    ) {
         let mut action_index = self.out_of_order_frames.len();
         let mut another_pass_neeeded = true;
 
@@ -716,7 +699,7 @@ impl Receiver {
                     continue;
                 },
                 Err(Fail { errno, cause: _ }) if errno == libc::ETIMEDOUT => {
-                    Sender::send_ack(cb, layer3_endpoint);
+                    cb.delivery.send_ack(&cb.connection_management, layer3_endpoint);
                     deadline = ack_deadline.get();
                 },
                 Err(_) => {
