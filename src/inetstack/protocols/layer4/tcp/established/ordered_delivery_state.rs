@@ -837,8 +837,8 @@ impl OrderedDeliveryState {
         let mut seg_len = data.len() as u32;
 
         // Check if the segment is in the receive window and trim off everything else.
-        Self::check_segment_in_window(
-            control_block,
+        control_block.delivery.check_segment_in_window(
+            &control_block.connection_management,
             layer3_endpoint,
             &mut header,
             &mut data,
@@ -877,7 +877,7 @@ impl OrderedDeliveryState {
             // Getting the current time is extremely cheap as it is just a variable lookup.
             control_block.delivery.ack_deadline_time_secs.set(Some(now + timeout));
         } else if has_data {
-            // We already owe our peer an ACK (the timer was already running), so cancel the timer and ACK now.
+            // We alreadcheck_and_process_acky owe our peer an ACK (the timer was already running), so cancel the timer and ACK now.
             control_block.delivery.ack_deadline_time_secs.set(None);
             trace!("process_packet(): sending ack before deadline because another packet arrived");
             control_block
@@ -1025,7 +1025,8 @@ impl OrderedDeliveryState {
     // should be ACK'd (unless they are RSTs), and then dropped.
     // Returns Ok if further processing is needed and EBADMSG if the packet is not within the receive window.
     fn check_segment_in_window(
-        cb: &mut ControlBlock,
+        &mut self,
+        connection_management: &ConnectionManagementState,
         layer3_endpoint: &mut SharedLayer3Endpoint,
         header: &mut TcpHeader,
         data: &mut DemiBuffer,
@@ -1062,9 +1063,9 @@ impl OrderedDeliveryState {
             *seg_end = *seg_start + SeqNumber::from(*seg_len - 1);
         }
 
-        let receive_next = cb.delivery.receive_next_seq_no;
+        let receive_next = self.receive_next_seq_no;
 
-        let after_receive_window = receive_next + SeqNumber::from(cb.delivery.receive_window_size());
+        let after_receive_window = receive_next + SeqNumber::from(self.receive_window_size());
 
         // Check if this segment fits in our receive window.
         // In the optimal case it starts at RCV.NXT, so we check for that first.
@@ -1077,7 +1078,7 @@ impl OrderedDeliveryState {
                     // This is an entirely duplicate (i.e. old) segment.  ACK (if not RST) and drop.
                     if !header.rst {
                         trace!("check_segment_in_window(): send ack on duplicate segment");
-                        cb.delivery.send_ack(&cb.connection_management, layer3_endpoint);
+                        self.send_ack(connection_management, layer3_endpoint);
                     }
                     let cause = "duplicate packet";
                     error!("check_segment_in_window(): {}", cause);
@@ -1104,7 +1105,7 @@ impl OrderedDeliveryState {
                     // This segment is completely outside of our window.  ACK (if not RST) and drop.
                     if !header.rst {
                         trace!("check_segment_in_window(): send ack on out-of-window segment");
-                        cb.delivery.send_ack(&cb.connection_management, layer3_endpoint);
+                        self.send_ack(connection_management, layer3_endpoint);
                     }
                     let cause = "packet outside of receive window";
                     error!("check_segment_in_window(): {}", cause);
