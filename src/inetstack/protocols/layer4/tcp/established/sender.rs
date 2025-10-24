@@ -532,7 +532,7 @@ impl Sender {
         }
     }
 
-    pub fn update_on_ack(&mut self, congestion_control: &CongestionControlState, header: &TcpHeader, now: Instant) {
+    fn update_on_ack(&mut self, congestion_control: &CongestionControlState, header: &TcpHeader, now: Instant) {
         // Start by checking that the ACK acknowledges something new.
         let send_unacknowledged = self.send_unacked.get();
         if send_unacknowledged < header.ack_num {
@@ -575,6 +575,15 @@ impl Sender {
                 self.unacked_queue.len()
             );
         }
+    }
+
+    pub fn process_ack(cb: &mut ControlBlock, header: &TcpHeader, now: Instant) {
+        // Check and update send window if necessary.
+        cb.flow_control.update_send_window(header);
+        cb.congestion_control.process_samples_on_ack(&cb.delivery, header, now);
+        cb.connection_management
+            .process_multiple_acked_fins(&cb.delivery, header);
+        cb.delivery.sender.update_on_ack(&cb.congestion_control, header, now);
     }
 
     /// Send an ACK to our peer, reflecting our current state.
