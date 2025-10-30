@@ -19,6 +19,7 @@ use crate::{
             layer3::SharedLayer3Endpoint,
             layer4::tcp::{
                 established::{
+                    congestion_control_state::CongestionControlState,
                     connection_management_state::ConnectionManagementState,
                     ctrlblk::{ControlBlock, State},
                     MAX_WINDOW_SIZE_WITHOUT_SCALING, MAX_WINDOW_SIZE_WITH_SCALING,
@@ -39,7 +40,7 @@ use crate::{
 // TODO: We currently allocate these on the fly when we add a buffer to the queue.  Would be more efficient to have a
 // buffer structure that held everything we need directly, thus avoiding this extra wrapper.
 //
-struct UnackedSegment {
+pub struct UnackedSegment {
     pub bytes: Option<DemiBuffer>,
     // Set to `None` on retransmission to implement Karn's algorithm.
     pub initial_tx: Option<Instant>,
@@ -82,10 +83,9 @@ pub struct OrderedDeliveryState {
     //
 
     // Sequence Number of the oldest byte of unacknowledged sent data.  In RFC 793 terms, this is SND.UNA.
-    send_unacked: SharedAsyncValue<SeqNumber>,
+    pub(crate) send_unacked: SharedAsyncValue<SeqNumber>,
 
-    // Queue of unacknowledged sent data.  RFC 793 calls this the "retransmission queue".
-    unacked_queue: SharedAsyncQueue<UnackedSegment>,
+    pub(crate) unacked_queue: SharedAsyncQueue<UnackedSegment>,
 
     // Send timers
     // Current retransmission timer expiration time.
@@ -100,7 +100,7 @@ pub struct OrderedDeliveryState {
     unsent_next_seq_no: SeqNumber,
 
     // Sequence number of the FIN, after we should never allocate more sequence numbers.
-    sender_fin_seq_no: Option<SeqNumber>,
+    pub sender_fin_seq_no: Option<SeqNumber>,
 
     // This is the send buffer (user data we do not yet have window to send). If the option is None, then it indicates
     // a FIN. This keeps us from having to allocate an empty Demibuffer to indicate FIN.
@@ -187,33 +187,6 @@ impl OrderedDeliveryState {
     //======================================================================================================================
     // Sender methods
     //======================================================================================================================
-
-    fn process_acked_fin(cb: &mut ControlBlock, bytes_remaining: usize, ack_num: SeqNumber) -> usize {
-        // This buffer is the end-of-send marker.  So we should only have one byte of acknowledged
-        // sequence space remaining (corresponding to our FIN).
-        debug_assert_eq!(bytes_remaining, 1);
-
-        // Double check that the ack is for the FIN sequence number.
-        debug_assert_eq!(
-            ack_num,
-            cb.delivery
-                .sender_fin_seq_no
-                .map(|s| { s + 1.into() })
-                .expect("should have a FIN set")
-        );
-
-        cb.connection_management.state = match cb.connection_management.state {
-            State::FinWait1 => State::FinWait2,
-            State::Closing => State::TimeWait,
-            State::LastAck => State::Closed,
-            state => unreachable!(
-                "cannot receive a response to a FIN if one was not sent in state {:?}",
-                state
-            ),
-        };
-
-        0
-    }
 
     fn process_acked_segment(&mut self, bytes_remaining: usize, mut segment: UnackedSegment) -> usize {
         let mut data = segment
@@ -645,30 +618,33 @@ impl OrderedDeliveryState {
         }
     }
 
-    pub fn process_ack(cb: &mut ControlBlock, header: &TcpHeader, now: Instant) {
+    pub fn process_ack_state_change(
+        &mut self,
+        congestion_control_state: &CongestionControlState,
+        header: &TcpHeader,
+        now: Instant,
+    ) {
         // Start by checking that the ACK acknowledges something new.
-        let send_unacknowledged = cb.delivery.send_unacked.get();
-        // Check and update send window if necessary.
-        cb.flow_control.update_send_window(header);
-
+        let send_unacknowledged = self.send_unacked.get();
         if send_unacknowledged < header.ack_num {
             // Remove the now acknowledged data from the unacknowledged queue, update the acked sequence number
             // and update the sender window.
 
             // Convert the difference in sequence numbers into a u32.
-            let bytes_acknowledged: u32 = (header.ack_num - cb.delivery.send_unacked.get()).into();
+            let bytes_acknowledged: u32 = (header.ack_num - self.send_unacked.get()).into();
             // Convert that into a usize for counting bytes to remove from the unacked queue.
             let mut bytes_remaining = bytes_acknowledged as usize;
             // Remove bytes from the unacked queue.
             while bytes_remaining != 0 {
-                bytes_remaining = match cb.delivery.unacked_queue.try_pop() {
+                bytes_remaining = match self.unacked_queue.try_pop() {
                     Some(segment) if segment.bytes.is_none() => {
-                        Self::process_acked_fin(cb, bytes_remaining, header.ack_num)
+                        // Set to 0 since we need to break instantly, as it means
+                        // we have seen a FIN packet
+                        0
                     },
                     Some(segment) => {
                         // We add the sample outside the Sender function to separate state.
-                        cb.congestion_control.add_sample(segment.initial_tx, now);
-                        cb.delivery.process_acked_segment(bytes_remaining, segment)
+                        self.process_acked_segment(bytes_remaining, segment)
                     },
                     None => {
                         unreachable!("There should be enough data in the unacked_queue for the number of bytes acked")
@@ -677,27 +653,24 @@ impl OrderedDeliveryState {
             }
 
             // Update SND.UNA to SEG.ACK.
-            cb.delivery.send_unacked.set(header.ack_num);
+            self.send_unacked.set(header.ack_num);
 
             // Reset the retransmit timer if necessary. If there is more data that hasn't been acked, then set to the
             // next segment deadline, otherwise, do not set.
-            let retransmit_deadline_time_secs = cb
-                .delivery
-                .update_retransmit_deadline(now, cb.congestion_control.rto_calculator.rto());
+            let retransmit_deadline_time_secs =
+                self.update_retransmit_deadline(now, congestion_control_state.rto_calculator.rto());
             #[cfg(debug_assertions)]
             if retransmit_deadline_time_secs.is_none() {
-                debug_assert_eq!(cb.delivery.send_next_seq_no.get(), header.ack_num);
+                debug_assert_eq!(self.send_next_seq_no.get(), header.ack_num);
             }
-            cb.delivery
-                .retransmit_deadline_time_secs
-                .set(retransmit_deadline_time_secs);
+            self.retransmit_deadline_time_secs.set(retransmit_deadline_time_secs);
         } else {
             // Duplicate ACK (doesn't acknowledge anything new).  We can mostly ignore this, except for fast-retransmit.
             // TODO: Implement fast-retransmit.  In which case, we'd increment our dup-ack counter here.
             trace!(
-                "process_ack(): received duplicate ack ({:?}); unacked len = {:?}",
+                "OrderedDeliveryState::process_ack_state_change(): received duplicate ack ({:?}); unacked len = {:?}",
                 header.ack_num,
-                cb.delivery.unacked_queue.len()
+                self.unacked_queue.len()
             );
         }
     }
@@ -848,7 +821,7 @@ impl OrderedDeliveryState {
         )?;
         Self::check_and_process_rst(control_block, &header)?;
         Self::check_syn(&header)?;
-        Self::check_and_process_ack(control_block, &header, now)?;
+        control_block.check_and_process_ack(&header, now)?;
 
         // TODO: Check the URG bit.  If we decide to support this, how should we do it?
         if header.urg {
@@ -1187,23 +1160,6 @@ impl OrderedDeliveryState {
             // TODO: Start the close coroutine
             return Err(Fail::new(libc::EBADMSG, cause));
         }
-        Ok(())
-    }
-
-    // Check the ACK bit.
-    fn check_and_process_ack(cb: &mut ControlBlock, header: &TcpHeader, now: Instant) -> Result<(), Fail> {
-        if !header.ack {
-            // All segments on established connections should be ACKs.  Drop this segment.
-            let cause = "Received non-ACK segment on established connection";
-            error!("{}", cause);
-            return Err(Fail::new(libc::EBADMSG, cause));
-        }
-
-        // TODO: RFC 5961 "Blind Data Injection Attack" prevention would have us perform additional ACK validation
-        // checks here.
-
-        Self::process_ack(cb, header, now);
-
         Ok(())
     }
 
