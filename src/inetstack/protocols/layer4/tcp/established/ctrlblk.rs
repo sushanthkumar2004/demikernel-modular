@@ -8,14 +8,18 @@
 use std::time::Instant;
 
 use crate::{
-    inetstack::protocols::layer4::tcp::{
-        established::{
-            congestion_control_state::CongestionControlState, connection_management_state::ConnectionManagementState,
-            flow_control_state::FlowControlState, ordered_delivery_state::OrderedDeliveryState,
+    inetstack::protocols::{
+        layer3::SharedLayer3Endpoint,
+        layer4::tcp::{
+            established::{
+                congestion_control_state::CongestionControlState,
+                connection_management_state::ConnectionManagementState, flow_control_state::FlowControlState,
+                ordered_delivery_state::OrderedDeliveryState,
+            },
+            header::TcpHeader,
         },
-        header::TcpHeader,
     },
-    runtime::fail::Fail,
+    runtime::{fail::Fail, memory::DemiBuffer},
 };
 
 //======================================================================================================================
@@ -98,5 +102,29 @@ impl ControlBlock {
         self.process_ack(header, now);
 
         Ok(())
+    }
+
+    // Takes a segment and attempts to send it. The buffer must be non-zero length and the function returns the number
+    // of bytes sent.
+    pub fn send_segment(
+        &mut self,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+        now: Instant,
+        segment: &mut DemiBuffer,
+    ) -> usize {
+        debug_assert!(!segment.is_empty());
+
+        let max_frame_size_bytes = self
+            .congestion_control
+            .get_max_frame_size(&self.delivery, &self.flow_control);
+
+        self.delivery.transmit_segment(
+            &self.connection_management,
+            &self.congestion_control,
+            layer3_endpoint,
+            now,
+            segment,
+            max_frame_size_bytes,
+        )
     }
 }

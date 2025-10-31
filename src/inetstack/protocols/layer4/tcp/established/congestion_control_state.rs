@@ -1,7 +1,10 @@
-use std::time::Instant;
+use std::{cmp, time::Instant};
 
 use crate::inetstack::protocols::layer4::tcp::{
-    established::{congestion_control, ordered_delivery_state::OrderedDeliveryState, rto::RtoCalculator},
+    established::{
+        congestion_control, flow_control_state::FlowControlState, ordered_delivery_state::OrderedDeliveryState,
+        rto::RtoCalculator,
+    },
     header::TcpHeader,
 };
 
@@ -77,5 +80,52 @@ impl CongestionControlState {
                 delivery_state.unacked_queue.len()
             );
         }
+    }
+
+    pub fn get_open_window_size_bytes(
+        &mut self,
+        delivery: &OrderedDeliveryState,
+        flow_control: &FlowControlState,
+    ) -> usize {
+        // Calculate amount of data in flight (SND.NXT - SND.UNA).
+        let send_unacknowledged = delivery.send_unacked.get();
+        let send_next = delivery.send_next_seq_no.get();
+        let sent_data = (send_next - send_unacknowledged).into();
+
+        // Before we get cwnd for the check, we prompt it to shrink it if the connection has been idle.
+        self.cc_algorithm.on_cwnd_check_before_send();
+        let cwnd = self.cc_algorithm.get_cwnd();
+
+        // The limited transmit algorithm can increase the effective size of cwnd by up to 2MSS.
+        let effective_cwnd = cwnd.get() + self.cc_algorithm.get_limited_transmit_cwnd_increase().get();
+
+        let win_sz = flow_control.send_window.get();
+
+        if Self::has_open_window(win_sz, sent_data, effective_cwnd) {
+            Self::calculate_open_window_bytes(win_sz, sent_data, flow_control.mss, effective_cwnd)
+        } else {
+            0
+        }
+    }
+
+    fn has_open_window(win_sz: u32, sent_data: u32, effective_cwnd: u32) -> bool {
+        win_sz > 0 && win_sz >= sent_data && effective_cwnd >= sent_data
+    }
+
+    fn calculate_open_window_bytes(win_sz: u32, sent_data: u32, mss: usize, effective_cwnd: u32) -> usize {
+        cmp::min(
+            cmp::min((win_sz - sent_data) as usize, mss),
+            (effective_cwnd - sent_data) as usize,
+        )
+    }
+
+    pub fn get_max_frame_size(&mut self, delivery: &OrderedDeliveryState, flow_control: &FlowControlState) -> usize {
+        let max_frame_size_bytes = self.get_open_window_size_bytes(delivery, flow_control);
+        let rto = self.rto_calculator.rto();
+        self.cc_algorithm.on_send(
+            rto,
+            (delivery.send_next_seq_no.get() - delivery.send_unacked.get()).into(),
+        );
+        max_frame_size_bytes
     }
 }
