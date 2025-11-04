@@ -1,5 +1,4 @@
 use std::{
-    cmp,
     collections::VecDeque,
     time::{Duration, Instant},
 };
@@ -251,7 +250,7 @@ impl OrderedDeliveryState {
             for mut buf in bufs.into_iter() {
                 cb.delivery.unsent_next_seq_no = cb.delivery.unsent_next_seq_no + (buf.len() as u32).into();
                 if cb.flow_control.send_window.get() > 0 {
-                    Self::send_segment(cb, layer3_endpoint, runtime.now(), &mut buf);
+                    cb.send_segment(layer3_endpoint, runtime.now(), &mut buf);
 
                     if !buf.is_empty() {
                         cb.delivery.unsent_queue.push(buf);
@@ -337,7 +336,7 @@ impl OrderedDeliveryState {
                 // TODO: Silly window syndrome - See RFC 1122's discussion of the SWS avoidance algorithm.
 
                 // We have some window, try to send some or all of the segment.
-                let _ = Self::send_segment(cb, layer3_endpoint, now, &mut buffer);
+                let _ = cb.send_segment(layer3_endpoint, now, &mut buffer);
                 // If the buffer is now empty, then we sent all of it.
                 if buffer.is_empty() {
                     return Ok(());
@@ -393,17 +392,15 @@ impl OrderedDeliveryState {
         }
     }
 
-    // Takes a segment and attempts to send it. The buffer must be non-zero length and the function returns the number
-    // of bytes sent.
-    fn send_segment(
-        cb: &mut ControlBlock,
+    pub fn transmit_segment(
+        &mut self,
+        connection_management: &ConnectionManagementState,
+        congestion_control: &CongestionControlState,
         layer3_endpoint: &mut SharedLayer3Endpoint,
         now: Instant,
         segment: &mut DemiBuffer,
+        max_frame_size_bytes: usize,
     ) -> usize {
-        debug_assert!(!segment.is_empty());
-
-        let max_frame_size_bytes = Self::get_open_window_size_bytes(cb);
         if max_frame_size_bytes == 0 {
             return 0;
         }
@@ -425,28 +422,20 @@ impl OrderedDeliveryState {
 
         let segment_data_len = segment_data.len() as u32;
 
-        let rto = cb.congestion_control.rto_calculator.rto();
-        cb.congestion_control.cc_algorithm.on_send(
-            rto,
-            (cb.delivery.send_next_seq_no.get() - cb.delivery.send_unacked.get()).into(),
-        );
-
         // Prepare the segment and send it.
-        let mut header = cb.delivery.tcp_header(&cb.connection_management, None);
+        let mut header = self.tcp_header(connection_management, None);
         if do_push {
             header.psh = true;
         }
-        cb.delivery.emit(
-            &cb.connection_management,
+        self.emit(
+            connection_management,
             layer3_endpoint,
             header,
             Some(segment_data.clone()),
         );
 
         // Update SND.NXT.
-        cb.delivery
-            .send_next_seq_no
-            .modify(|s| s + SeqNumber::from(segment_data_len));
+        self.send_next_seq_no.modify(|s| s + SeqNumber::from(segment_data_len));
 
         // Put this segment on the unacknowledged list.
         let unacked_segment = UnackedSegment {
@@ -454,19 +443,16 @@ impl OrderedDeliveryState {
             initial_tx: Some(now),
         };
 
-        if !cb.delivery.unacked_queue.is_empty() {
-            trace!(
-                "send_segment(): unacked_queue.len() = {:?}",
-                cb.delivery.unacked_queue.len()
-            );
+        if !self.unacked_queue.is_empty() {
+            trace!("send_segment(): unacked_queue.len() = {:?}", self.unacked_queue.len());
         }
 
-        cb.delivery.unacked_queue.push(unacked_segment);
+        self.unacked_queue.push(unacked_segment);
 
         // Set the retransmit timer.
-        if cb.delivery.retransmit_deadline_time_secs.get().is_none() {
-            let rto = cb.congestion_control.rto_calculator.rto();
-            cb.delivery.retransmit_deadline_time_secs.set(Some(now + rto));
+        if self.retransmit_deadline_time_secs.get().is_none() {
+            let rto = congestion_control.rto_calculator.rto();
+            self.retransmit_deadline_time_secs.set(Some(now + rto));
         }
         segment_data_len as usize
     }
@@ -488,43 +474,6 @@ impl OrderedDeliveryState {
         header.seq_num = seq_num.unwrap_or(self.send_next_seq_no.get());
 
         header
-    }
-
-    fn get_open_window_size_bytes(cb: &mut ControlBlock) -> usize {
-        // Calculate amount of data in flight (SND.NXT - SND.UNA).
-        let send_unacknowledged = cb.delivery.send_unacked.get();
-        let send_next = cb.delivery.send_next_seq_no.get();
-        let sent_data = (send_next - send_unacknowledged).into();
-
-        // Before we get cwnd for the check, we prompt it to shrink it if the connection has been idle.
-        cb.congestion_control.cc_algorithm.on_cwnd_check_before_send();
-        let cwnd = cb.congestion_control.cc_algorithm.get_cwnd();
-
-        // The limited transmit algorithm can increase the effective size of cwnd by up to 2MSS.
-        let effective_cwnd = cwnd.get()
-            + cb.congestion_control
-                .cc_algorithm
-                .get_limited_transmit_cwnd_increase()
-                .get();
-
-        let win_sz = cb.flow_control.send_window.get();
-
-        if Self::has_open_window(win_sz, sent_data, effective_cwnd) {
-            Self::calculate_open_window_bytes(win_sz, sent_data, cb.flow_control.mss, effective_cwnd)
-        } else {
-            0
-        }
-    }
-
-    fn has_open_window(win_sz: u32, sent_data: u32, effective_cwnd: u32) -> bool {
-        win_sz > 0 && win_sz >= sent_data && effective_cwnd >= sent_data
-    }
-
-    fn calculate_open_window_bytes(win_sz: u32, sent_data: u32, mss: usize, effective_cwnd: u32) -> usize {
-        cmp::min(
-            cmp::min((win_sz - sent_data) as usize, mss),
-            (effective_cwnd - sent_data) as usize,
-        )
     }
 
     pub async fn background_retransmitter(
