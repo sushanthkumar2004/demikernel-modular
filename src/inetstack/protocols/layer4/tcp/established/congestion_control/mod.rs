@@ -47,6 +47,8 @@ where
     fn get_retransmit_now_flag(&self) -> SharedAsyncValue<bool>;
 
     fn on_fast_retransmit(&mut self) {}
+
+    fn handle_duplicate_ack(&mut self, send_next: SeqNumber, ack_seq_no: SeqNumber);
 }
 
 pub trait LimitedTransmit

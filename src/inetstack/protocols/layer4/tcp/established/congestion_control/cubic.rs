@@ -349,6 +349,10 @@ impl FastRetransmitRecovery for Cubic {
         // I should really use some other mechanism here just because it would be nicer...
         self.fast_retransmit_now.set_without_notify(false);
     }
+
+    fn handle_duplicate_ack(&mut self, send_next: SeqNumber, ack_seq_no: SeqNumber) {
+        self.on_dup_ack_received(send_next, ack_seq_no);
+    }
 }
 
 impl LimitedTransmit for Cubic {
