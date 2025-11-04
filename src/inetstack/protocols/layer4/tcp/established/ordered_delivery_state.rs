@@ -620,7 +620,7 @@ impl OrderedDeliveryState {
 
     pub fn process_ack_state_change(
         &mut self,
-        congestion_control_state: &CongestionControlState,
+        congestion_control_state: &mut CongestionControlState,
         header: &TcpHeader,
         now: Instant,
     ) {

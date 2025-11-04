@@ -51,6 +51,10 @@ impl FastRetransmitRecovery for None {
     fn get_retransmit_now_flag(&self) -> SharedAsyncValue<bool> {
         self.fast_retransmit_flag.clone()
     }
+
+    fn handle_duplicate_ack(&mut self, _send_next: SeqNumber, _ack_seq_no: SeqNumber) {
+        // No-op for the `None` congestion control implementation.
+    }
 }
 impl LimitedTransmit for None {
     fn get_limited_transmit_cwnd_increase(&self) -> SharedAsyncValue<u32> {

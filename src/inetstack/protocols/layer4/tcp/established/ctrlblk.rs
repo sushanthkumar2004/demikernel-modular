@@ -81,7 +81,7 @@ impl ControlBlock {
             .process_ack_state_change(&self.delivery, header, now);
 
         self.delivery
-            .process_ack_state_change(&self.congestion_control, header, now);
+            .process_ack_state_change(&mut self.congestion_control, header, now);
     }
 
     // Check the ACK bit.
