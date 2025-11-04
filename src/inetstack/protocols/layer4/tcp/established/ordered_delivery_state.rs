@@ -666,9 +666,11 @@ impl OrderedDeliveryState {
             self.retransmit_deadline_time_secs.set(retransmit_deadline_time_secs);
         } else {
             // Duplicate ACK (doesn't acknowledge anything new). Handle fast-retransmit.
-            congestion_control_state
-                .cc_algorithm
-                .handle_duplicate_ack(self.send_next_seq_no.get(), header.ack_num);
+            if send_unacknowledged == header.ack_num {
+                congestion_control_state
+                    .cc_algorithm
+                    .handle_duplicate_ack(self.send_next_seq_no.get(), header.ack_num);
+            }
 
             trace!(
                 "OrderedDeliveryState::process_ack_state_change(): received duplicate ack ({:?}); unacked len = {:?}",
