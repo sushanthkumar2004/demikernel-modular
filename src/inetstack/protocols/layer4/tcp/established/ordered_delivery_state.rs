@@ -147,6 +147,9 @@ pub struct OrderedDeliveryState {
     // receive window) but can't yet present to the user because we're missing some other data that comes between this
     // and what we've already presented to the user.
     out_of_order_frames: VecDeque<(SeqNumber, DemiBuffer)>,
+
+    // Counter for duplicate ACKs.
+    dup_ack_count: usize,
 }
 
 impl OrderedDeliveryState {
@@ -180,6 +183,9 @@ impl OrderedDeliveryState {
             buffer_size_bytes: window_size_bytes,
             window_scale_shift_bits,
             out_of_order_frames: VecDeque::with_capacity(64),
+
+            // Initialize duplicate ACK counter.
+            dup_ack_count: 0,
         }
     }
 
@@ -613,13 +619,23 @@ impl OrderedDeliveryState {
                 debug_assert_eq!(self.send_next_seq_no.get(), header.ack_num);
             }
             self.retransmit_deadline_time_secs.set(retransmit_deadline_time_secs);
+
+            // Reset duplicate ACK counter.
+            self.dup_ack_count = 0;
         } else {
-            // Duplicate ACK (doesn't acknowledge anything new).  We can mostly ignore this, except for fast-retransmit.
-            // TODO: Implement fast-retransmit.  In which case, we'd increment our dup-ack counter here.
+            // Duplicate ACK (doesn't acknowledge anything new). Handle fast-retransmit.
+            self.dup_ack_count += 1;
+
+            // If the duplicate ACK count reaches the threshold (e.g., 3), set the retransmit_now_flag.
+            if self.dup_ack_count >= 3 {
+                congestion_control_state.cc_algorithm.set_retransmit_now_flag(true);
+            }
+
             trace!(
-                "OrderedDeliveryState::process_ack_state_change(): received duplicate ack ({:?}); unacked len = {:?}",
+                "OrderedDeliveryState::process_ack_state_change(): received duplicate ack ({:?}); unacked len = {:?}, dup_ack_count = {:?}",
                 header.ack_num,
-                self.unacked_queue.len()
+                self.unacked_queue.len(),
+                self.dup_ack_count
             );
         }
     }
