@@ -46,7 +46,15 @@ where
 
     fn get_retransmit_now_flag(&self) -> SharedAsyncValue<bool>;
 
+    // This should be responsible for setting the retransmit now flag to false, since
+    // we call this function when we done retransmitting a segment and when we received
+    // a brand new ack, in which case we no longer need to assert the retransmit flag.
     fn on_fast_retransmit(&mut self) {}
+
+    #[allow(unused_variables)]
+    fn handle_dup_ack(&mut self, send_next: SeqNumber, ack_seq_no: SeqNumber) {}
+
+    fn reset_dup_ack_count(&mut self) {}
 }
 
 pub trait LimitedTransmit

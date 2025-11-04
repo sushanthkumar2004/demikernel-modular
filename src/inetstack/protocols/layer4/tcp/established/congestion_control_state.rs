@@ -47,6 +47,12 @@ impl CongestionControlState {
     ) {
         let send_unacknowledged = delivery_state.send_unacked.get();
         if send_unacknowledged < header.ack_num {
+            // Unset the duplicate ack count, and also unset the fast retransmit flag since we have now received
+            // a brand new ack. Note that we do not set the duplicate ack count to 0 anywhere else in the code,
+            // except in the initial starting phase where we try to dynamically find the window size (cwnd)
+            self.cc_algorithm.reset_dup_ack_count();
+            self.cc_algorithm.on_fast_retransmit();
+
             // Iterate over the now acknowledged data and process samples to modify our control state parameters.
             // Convert the difference in sequence numbers into a u32.
             let bytes_acknowledged_u32: u32 = (header.ack_num - delivery_state.send_unacked.get()).into();
@@ -73,6 +79,11 @@ impl CongestionControlState {
                 }
             }
         } else {
+            if send_unacknowledged == header.ack_num {
+                self.cc_algorithm
+                    .handle_dup_ack(delivery_state.send_next_seq_no.get(), header.ack_num);
+            }
+
             // Duplicate ACK (doesn't acknowledge anything new). We can mostly ignore this, except for fast-retransmit.
             trace!(
                 "CongestionControlState::process_samples_on_ack(): received duplicate ack ({:?}); unacked len = {:?}",

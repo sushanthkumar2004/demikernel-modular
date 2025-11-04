@@ -38,7 +38,7 @@ pub struct Cubic {
     pub mss: u32, // Just for convenience, otherwise we have `as u32` or `.try_into().unwrap()` scattered everywhere...
     // Slow Start / Congestion Avoidance State.
     pub ca_start: Cell<Instant>,     // The time we started the current congestion avoidance.
-    pub cwnd: SharedAsyncValue<u32>, // Congestion window: Max number of bytes that may be in flight ot prevent congestion.
+    pub cwnd: SharedAsyncValue<u32>, // Congestion window: Max number of bytes that may be in flight to prevent congestion.
     pub fast_convergence: bool, // Should we employ the fast convergence algorithm (Only recommended if there are multiple CUBIC streams on the same network, in which case we'll cede capacity to new ones faster).
     pub initial_cwnd: u32,      // The initial value of cwnd, which gets used if the connection ever resets.
     pub last_send_time: Cell<Instant>, // The moment at which we last sent data.
@@ -348,6 +348,19 @@ impl FastRetransmitRecovery for Cubic {
         // I suspect it doesn't matter because we only retransmit on the 3rd repeat ACK precisely...
         // I should really use some other mechanism here just because it would be nicer...
         self.fast_retransmit_now.set_without_notify(false);
+    }
+
+    fn handle_dup_ack(&mut self, send_next: SeqNumber, ack_seq_no: SeqNumber) {
+        // ACK is a duplicate
+        self.on_dup_ack_received(send_next, ack_seq_no);
+        // We attempt to keep track of the number of retransmitted packets in flight because we do not alter
+        // ssthresh if a packet is lost when it has been retransmitted. There is almost certainly a better way.
+        self.retransmitted_packets_in_flight
+            .set(self.retransmitted_packets_in_flight.get().saturating_sub(1));
+    }
+
+    fn reset_dup_ack_count(&mut self) {
+        self.duplicate_ack_count.set(0);
     }
 }
 
