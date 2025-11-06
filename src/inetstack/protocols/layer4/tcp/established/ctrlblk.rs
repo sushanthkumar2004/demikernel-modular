@@ -7,19 +7,25 @@
 
 use std::time::Instant;
 
+use arrayvec::ArrayVec;
+
 use crate::{
-    inetstack::protocols::{
-        layer3::SharedLayer3Endpoint,
-        layer4::tcp::{
-            established::{
-                congestion_control_state::CongestionControlState,
-                connection_management_state::ConnectionManagementState, flow_control_state::FlowControlState,
-                ordered_delivery_state::OrderedDeliveryState,
+    inetstack::{
+        consts::MAX_BATCH_SIZE_NUM_PACKETS,
+        protocols::{
+            layer3::SharedLayer3Endpoint,
+            layer4::tcp::{
+                established::{
+                    congestion_control_state::CongestionControlState,
+                    connection_management_state::ConnectionManagementState,
+                    flow_control_state::FlowControlState,
+                    ordered_delivery_state::{OrderedDeliveryState, UNSENT_QUEUE_CUTOFF},
+                },
+                header::TcpHeader,
             },
-            header::TcpHeader,
         },
     },
-    runtime::{fail::Fail, memory::DemiBuffer},
+    runtime::{fail::Fail, memory::DemiBuffer, SharedDemiRuntime},
 };
 
 //======================================================================================================================
@@ -126,5 +132,60 @@ impl ControlBlock {
             segment,
             max_frame_size_bytes,
         )
+    }
+
+    // This function sends a list of packets (or FIN if empty) and waits for it to be acked.
+    pub async fn push(
+        &mut self,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+        runtime: &mut SharedDemiRuntime,
+        bufs: ArrayVec<DemiBuffer, MAX_BATCH_SIZE_NUM_PACKETS>,
+    ) -> Result<(), Fail> {
+        // If the user is done sending (i.e. has called close on this connection), then they shouldn't be sending.
+        debug_assert!(self.delivery.sender_fin_seq_no.is_none());
+
+        // TODO: We need to fix this the correct way: limit our send buffer size to the amount we're willing to buffer.
+        if self.delivery.unsent_queue.len() > UNSENT_QUEUE_CUTOFF - 1 {
+            return Err(Fail::new(libc::EBUSY, "too many packets to send"));
+        }
+
+        trace!("push(): total unsent segments={:?}", self.delivery.unsent_queue.len());
+
+        // Check if closing the socket and sending FIN.
+        if bufs.is_empty() {
+            // We can always send the FIN immediately.
+            self.delivery.sender_fin_seq_no = Some(self.delivery.unsent_next_seq_no);
+            self.delivery.unsent_next_seq_no = self.delivery.unsent_next_seq_no + 1.into();
+            self.delivery.send_fin(
+                &self.congestion_control,
+                &self.connection_management,
+                layer3_endpoint,
+                runtime.now(),
+            )?;
+        } else {
+            for mut buf in bufs.into_iter() {
+                self.delivery.unsent_next_seq_no = self.delivery.unsent_next_seq_no + (buf.len() as u32).into();
+                if self.flow_control.send_window.get() > 0 {
+                    self.send_segment(layer3_endpoint, runtime.now(), &mut buf);
+
+                    if !buf.is_empty() {
+                        self.delivery.unsent_queue.push(buf);
+                    }
+                }
+            }
+        }
+
+        if !self.delivery.unacked_queue.is_empty() {
+            trace!("push(): total unacked segments={:?}", self.delivery.unacked_queue.len());
+        }
+
+        // Wait until the sequnce number of the pushed buffer is acknowledged.
+        let mut send_unacked_watched = self.delivery.send_unacked.clone();
+        let ack_seq_no = self.delivery.unsent_next_seq_no;
+        debug_assert!(send_unacked_watched.get() < ack_seq_no);
+        while send_unacked_watched.get() < ack_seq_no {
+            send_unacked_watched.wait_for_change(None).await?;
+        }
+        Ok(())
     }
 }
