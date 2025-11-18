@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use futures::{never::Never, FutureExt};
+use futures::never::Never;
 
 use crate::{
     inetstack::protocols::{
@@ -130,14 +130,14 @@ impl ControlBlock {
         )
     }
 
-    async fn send_buffer(
+    /*     async fn send_buffer(
         &mut self,
         layer3_endpoint: &mut SharedLayer3Endpoint,
         now: Instant,
         mut buffer: DemiBuffer,
     ) -> Result<(), Fail> {
         let mut send_unacked_watched = self.delivery.send_unacked.clone();
-        let mut cwnd_watched = self.congestion_control.cc_algorithm.get_cwnd();
+            let mut cwnd_watched = self.congestion_control.cc_algorithm.get_cwnd();
 
         // The limited transmit algorithm may increase the effective size of cwnd by up to 2 * mss.
         let mut ltci_watched = self
@@ -145,7 +145,6 @@ impl ControlBlock {
             .cc_algorithm
             .get_limited_transmit_cwnd_increase();
         let mut win_sz_watched = self.flow_control.send_window.clone();
-
         // Try in a loop until we send this segment.
         loop {
             // If we don't have any window size at all, we need to transition to PERSIST mode and
@@ -185,7 +184,7 @@ impl ControlBlock {
                 };
             }
         }
-    }
+    } */
 
     pub async fn background_sender(
         &mut self,
@@ -193,9 +192,43 @@ impl ControlBlock {
         runtime: &mut SharedDemiRuntime,
     ) -> Result<Never, Fail> {
         loop {
-            // Get next bit of unsent data.
-            let buffer = self.delivery.unsent_queue.pop(None).await?;
-            self.send_buffer(layer3_endpoint, runtime.now(), buffer).await?;
+            // Get next bit of unsent data (ownership stays with `buffer` until we finish sending it).
+            let mut buffer = self.delivery.unsent_queue.pop(None).await?;
+
+            // Clone watcher handles
+            let mut send_unacked_watched = self.delivery.send_unacked.clone();
+            let mut cwnd_watched = self.congestion_control.cc_algorithm.get_cwnd();
+            let mut ltci_watched = self
+                .congestion_control
+                .cc_algorithm
+                .get_limited_transmit_cwnd_increase();
+            let mut win_sz_watched = self.flow_control.send_window.clone();
+
+            let delivery = &mut self.delivery;
+            let flow_control = &mut self.flow_control;
+            let connection_management = &mut self.connection_management;
+            let congestion_control = &mut self.congestion_control;
+
+            loop {
+                let max_frame_size_bytes = congestion_control.get_max_frame_size(delivery, flow_control);
+
+                // pass references where appropriate so values are not moved out of this scope
+                delivery
+                    .rod_send_buffer(
+                        flow_control,
+                        connection_management,
+                        congestion_control,
+                        layer3_endpoint,
+                        runtime.now(),
+                        &mut buffer,
+                        max_frame_size_bytes,
+                        &mut send_unacked_watched,
+                        &mut cwnd_watched,
+                        &mut ltci_watched,
+                        &mut win_sz_watched,
+                    )
+                    .await?;
+            }
         }
     }
 }

@@ -339,6 +339,62 @@ impl OrderedDeliveryState {
         }
     }
 
+    pub async fn rod_send_buffer(
+        &mut self,
+        flow_control: &mut FlowControlState,
+        connection_management: &mut ConnectionManagementState,
+        congestion_control: &mut CongestionControlState,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+        now: Instant,
+        buffer: &mut DemiBuffer,
+        cc_max_frame_size_bytes: usize,
+        send_unacked_watched: &mut SharedAsyncValue<SeqNumber>,
+        cwnd_watched: &mut SharedAsyncValue<u32>,
+        ltci_watched: &mut SharedAsyncValue<u32>,
+        win_sz_watched: &mut SharedAsyncValue<u32>,
+    ) -> Result<(), Fail> {
+        // If we have zero window, send a one-byte window probe and return.
+        if win_sz_watched.get() == 0 {
+            // split_front borrows/mutates `buffer`; we already have &mut buffer.
+            let probe = buffer.split_front(1)?;
+            self.send_window_probe(flow_control, connection_management, layer3_endpoint, now, probe)
+                .await?;
+            return Ok(());
+        } else {
+            // TODO: Nagle's algorithm - We need to coalese small buffers together to send MSS sized packets.
+            // TODO: Silly window syndrome - See RFC 1122's discussion of the SWS avoidance algorithm.
+            // We have some window, try to send some or all of the segment.
+            // NOTE: Following function modifies congestion control state, and then
+            // the ordered delivery state in that order. Modularity still holds since within the loop
+            // we will either only modify ROD state or we will modify CC, then ROD state.
+            let _ = self.transmit_segment(
+                connection_management,
+                congestion_control,
+                layer3_endpoint,
+                now,
+                buffer,
+                cc_max_frame_size_bytes,
+            );
+
+            // If the buffer is now empty, we successfully sent all of it.
+            if buffer.is_empty() {
+                return Ok(());
+            }
+
+            // Otherwise wait for any of the limiting conditions to change, and then try again to finish sending the segment.
+            futures::select_biased! {
+                _ = send_unacked_watched.wait_for_change(None).fuse() => (),
+                _ = self.send_next_seq_no.wait_for_change(None).fuse() => (),
+                _ = win_sz_watched.wait_for_change(None).fuse() => (),
+                _ = cwnd_watched.wait_for_change(None).fuse() => (),
+                _ = ltci_watched.wait_for_change(None).fuse() => (),
+            };
+
+            // After waking we return to caller so the outer loop can re-evaluate and call us again.
+            return Ok(());
+        }
+    }
+
     pub fn transmit_segment(
         &mut self,
         connection_management: &ConnectionManagementState,
