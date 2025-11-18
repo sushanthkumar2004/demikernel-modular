@@ -476,7 +476,7 @@ impl OrderedDeliveryState {
         header
     }
 
-    pub async fn background_retransmitter(
+    pub async fn background_retransmitter_rod(
         cb: &mut ControlBlock,
         layer3_endpoint: &mut SharedLayer3Endpoint,
         runtime: &mut SharedDemiRuntime,
@@ -489,9 +489,6 @@ impl OrderedDeliveryState {
             let rtx_deadline = rtx_deadline_watched.get();
             let rtx_fast_retransmit = rtx_fast_retransmit_watched.get();
             if rtx_fast_retransmit {
-                // Notify congestion control about fast retransmit.
-                cb.congestion_control.cc_algorithm.on_fast_retransmit();
-
                 // Retransmit earliest unacknowledged segment.
                 Self::retransmit(cb, layer3_endpoint);
                 continue;
@@ -513,18 +510,8 @@ impl OrderedDeliveryState {
                     _ => continue,
                 },
                 Err(Fail { errno, cause: _ }) if errno == libc::ETIMEDOUT => {
-                    // Retransmit timeout.
-                    // Notify congestion control about RTO.
-                    cb.congestion_control
-                        .cc_algorithm
-                        .on_rto(cb.delivery.send_unacked.get());
-
                     // RFC 6298 Section 5.4: Retransmit earliest unacknowledged segment.
                     Self::retransmit(cb, layer3_endpoint);
-
-                    // RFC 6298 Section 5.5: Back off the retransmission timer.
-                    cb.congestion_control.rto_calculator.back_off();
-
                     // RFC 6298 Section 5.6: Restart the retransmission timer with the new RTO.
                     let deadline = runtime.now() + cb.congestion_control.rto_calculator.rto();
                     cb.delivery.retransmit_deadline_time_secs.set(Some(deadline));

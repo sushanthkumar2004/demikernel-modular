@@ -291,14 +291,24 @@ impl SharedEstablishedSocket {
         pin_mut!(acknowledger);
 
         let mut me2 = self.clone();
-        let retransmitter = async_timer!("tcp::established::background::retransmitter", async {
+        let retransmitter_cc = async_timer!("tcp::established::background::retransmitter_cc", async {
             let mut layer3_endpoint = me2.layer3_endpoint.clone();
             let mut runtime = me2.runtime.clone();
-            OrderedDeliveryState::background_retransmitter(&mut me2.control_block, &mut layer3_endpoint, &mut runtime)
+            CongestionControlState::background_retransmitter_cc(&mut me2.control_block, &mut layer3_endpoint, &mut runtime)
                 .await
         })
         .fuse();
-        pin_mut!(retransmitter);
+        pin_mut!(retransmitter_cc);
+
+        let retransmitter_rod = async_timer!("tcp::established::background::retransmitter_rod", async {
+            let mut layer3_endpoint = me2.layer3_endpoint.clone();
+            let mut runtime = me2.runtime.clone();
+            OrderedDeliveryState::background_retransmitter_rod(&mut me2.control_block, &mut layer3_endpoint, &mut runtime)
+                .await
+            
+        })
+        .fuse();
+        pin_mut!(retransmitter_rod);
 
         let mut me3 = self.clone();
         let sender = async_timer!("tcp::established::background::sender", async {
@@ -309,7 +319,7 @@ impl SharedEstablishedSocket {
         .fuse();
         pin_mut!(sender);
 
-        let result = futures::join!(acknowledger, retransmitter, sender);
+        let result = futures::join!(acknowledger, retransmitter_cc, retransmitter_rod, sender);
         debug!("{:?}", result);
     }
 }

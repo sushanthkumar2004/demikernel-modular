@@ -128,4 +128,57 @@ impl CongestionControlState {
         );
         max_frame_size_bytes
     }
+
+    pub async fn background_retransmitter_cc(
+        cb: &mut ControlBlock,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+        runtime: &mut SharedDemiRuntime,
+    ) -> Result<Never, Fail> {
+        // Watch the retransmission deadline.
+        let mut rtx_deadline_watched = cb.delivery.retransmit_deadline_time_secs.clone(); 
+        // Watch the fast retransmit flag.
+        let mut rtx_fast_retransmit_watched = cb.congestion_control.cc_algorithm.get_retransmit_now_flag();
+        loop {
+            let rtx_deadline = rtx_deadline_watched.get();
+            let rtx_fast_retransmit = rtx_fast_retransmit_watched.get();
+            if rtx_fast_retransmit {
+                // Notify congestion control about fast retransmit.
+                cb.congestion_control.cc_algorithm.on_fast_retransmit();
+                continue;
+            }
+
+            // If either changed, wake up.
+            let something_changed = async {
+                select_biased!(
+                    _ = rtx_deadline_watched.wait_for_change(None).fuse() => (),
+                    _ = rtx_fast_retransmit_watched.wait_for_change(None).fuse() => (),
+                )
+            };
+            pin_mut!(something_changed);
+            match conditional_yield_until(something_changed, rtx_deadline).await {
+                Ok(()) => match cb.delivery.sender_fin_seq_no {
+                    Some(fin_seq_no) if cb.delivery.send_unacked.get() > fin_seq_no => {
+                        return Err(Fail::new(libc::ECONNRESET, "connection closed"));
+                    },
+                    _ => continue,
+                },
+                Err(Fail { errno, cause: _ }) if errno == libc::ETIMEDOUT => {
+                    // Retransmit timeout.
+                    // Notify congestion control about RTO.
+                    cb.congestion_control
+                        .cc_algorithm
+                        .on_rto(cb.delivery.send_unacked.get());
+
+                    // RFC 6298 Section 5.5: Back off the retransmission timer.
+                    cb.congestion_control.rto_calculator.back_off();
+                },
+                Err(_) => {
+                    unreachable!(
+                        "either the retransmit deadline changed or the deadline passed, no other errors are possible!"
+                    )
+                },
+            }
+        }
+    }
+
 }
