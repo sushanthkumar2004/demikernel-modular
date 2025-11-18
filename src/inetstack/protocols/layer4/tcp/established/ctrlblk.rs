@@ -7,6 +7,8 @@
 
 use std::time::Instant;
 
+use futures::never::Never;
+
 use crate::{
     inetstack::protocols::{
         layer3::SharedLayer3Endpoint,
@@ -19,7 +21,7 @@ use crate::{
             header::TcpHeader,
         },
     },
-    runtime::{fail::Fail, memory::DemiBuffer},
+    runtime::{fail::Fail, memory::DemiBuffer, SharedDemiRuntime},
 };
 
 //======================================================================================================================
@@ -126,5 +128,82 @@ impl ControlBlock {
             segment,
             max_frame_size_bytes,
         )
+    }
+
+    // Specialized push method for when the buffers we push is empty (aka a FIN)
+    pub async fn push_fin(
+        &mut self,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+        runtime: &mut SharedDemiRuntime,
+    ) -> Result<(), Fail> {
+        self.delivery
+            .push_fin(
+                &self.congestion_control,
+                &self.connection_management,
+                layer3_endpoint,
+                runtime,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_timings_and_push_buf(
+        &mut self,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+        runtime: &mut SharedDemiRuntime,
+        buf: DemiBuffer,
+    ) -> Result<(), Fail> {
+        let max_frame_size_bytes = self
+            .congestion_control
+            .update_timings_before_push(&self.delivery, &self.flow_control)?;
+
+        self.delivery
+            .push_buf(
+                &self.flow_control,
+                &self.congestion_control,
+                &self.connection_management,
+                layer3_endpoint,
+                runtime,
+                buf,
+                max_frame_size_bytes,
+            )
+            .await
+    }
+
+    pub async fn push(
+        cb: &mut ControlBlock,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+        runtime: &mut SharedDemiRuntime,
+        buf: DemiBuffer,
+    ) -> Result<(), Fail> {
+        cb.update_timings_and_push_buf(layer3_endpoint, runtime, buf).await
+    }
+
+    pub async fn acknowledger(&mut self, layer3_endpoint: &mut SharedLayer3Endpoint) -> Result<Never, Fail> {
+        let mut ack_deadline = self.delivery.ack_deadline_time_secs.clone();
+        let mut deadline = ack_deadline.get();
+
+        loop {
+            // TODO: Implement TCP delayed ACKs, subject to restrictions from RFC 1122
+            // - TCP should implement a delayed ACK
+            // - The delay must be less than 500ms
+            // - For a stream of full-sized segments, there should be an ack for every other segment.
+            // TODO: Implement SACKs
+            match ack_deadline.wait_for_change_until(deadline).await {
+                Ok(value) => {
+                    deadline = value;
+                    continue;
+                },
+                Err(Fail { errno, cause: _ }) if errno == libc::ETIMEDOUT => {
+                    self.delivery.send_ack(&self.connection_management, layer3_endpoint);
+                    deadline = ack_deadline.get();
+                },
+                Err(_) => {
+                    unreachable!(
+                        "either the ack deadline changed or the deadline passed, no other errors are possible!"
+                    )
+                },
+            }
+        }
     }
 }

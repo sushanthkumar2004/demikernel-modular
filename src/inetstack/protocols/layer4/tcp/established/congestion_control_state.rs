@@ -1,11 +1,14 @@
 use std::{cmp, time::Instant};
 
-use crate::inetstack::protocols::layer4::tcp::{
-    established::{
-        congestion_control, flow_control_state::FlowControlState, ordered_delivery_state::OrderedDeliveryState,
-        rto::RtoCalculator,
+use crate::{
+    inetstack::protocols::layer4::tcp::{
+        established::{
+            congestion_control, flow_control_state::FlowControlState, ordered_delivery_state::OrderedDeliveryState,
+            rto::RtoCalculator,
+        },
+        header::TcpHeader,
     },
-    header::TcpHeader,
+    runtime::fail::Fail,
 };
 
 /// Congestion Control Parameters for TCP connection state
@@ -127,5 +130,19 @@ impl CongestionControlState {
             (delivery.send_next_seq_no.get() - delivery.send_unacked.get()).into(),
         );
         max_frame_size_bytes
+    }
+
+    pub fn update_timings_before_push(
+        &mut self,
+        delivery_state: &OrderedDeliveryState,
+        flow_control: &FlowControlState,
+    ) -> Result<usize, Fail> {
+        delivery_state.push_checks()?;
+
+        if flow_control.send_window.get() > 0 {
+            let max_frame_size_bytes = self.get_max_frame_size(delivery_state, flow_control);
+            return Ok(max_frame_size_bytes);
+        }
+        Ok(0)
     }
 }

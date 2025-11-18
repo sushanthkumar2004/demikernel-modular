@@ -21,6 +21,7 @@ use crate::{
                     congestion_control_state::CongestionControlState,
                     connection_management_state::ConnectionManagementState,
                     ctrlblk::{ControlBlock, State},
+                    flow_control_state::FlowControlState,
                     MAX_WINDOW_SIZE_WITHOUT_SCALING, MAX_WINDOW_SIZE_WITH_SCALING,
                 },
                 header::TcpHeader,
@@ -57,7 +58,7 @@ const MAX_OUT_OF_ORDER_SIZE_FRAMES: usize = 1024;
 // Hard limit for unsent queue.
 // TODO: Remove this.  We should limit the unsent queue by either having a (configurable) send buffer size (in bytes,
 // not segments) and rejecting send requests that exceed that, or by limiting the user's send buffer allocations.
-const UNSENT_QUEUE_CUTOFF: usize = 1024;
+pub(crate) const UNSENT_QUEUE_CUTOFF: usize = 1024;
 
 // Minimum size for unacknowledged queue. This number doesn't really matter very much, it just sets the initial size
 // of the unacked queue, below which memory allocation is not required.
@@ -103,7 +104,7 @@ pub struct OrderedDeliveryState {
 
     // This is the send buffer (user data we do not yet have window to send). If the option is None, then it indicates
     // a FIN. This keeps us from having to allocate an empty Demibuffer to indicate FIN.
-    unsent_queue: SharedAsyncQueue<DemiBuffer>,
+    pub(crate) unsent_queue: SharedAsyncQueue<DemiBuffer>,
 
     //
     // Receive Sequence Space:
@@ -223,49 +224,87 @@ impl OrderedDeliveryState {
         }
     }
 
-    // This function sends a list of packets (or FIN if empty) and waits for it to be acked.
-    pub async fn push(
-        cb: &mut ControlBlock,
-        layer3_endpoint: &mut SharedLayer3Endpoint,
-        runtime: &mut SharedDemiRuntime,
-        bufs: ArrayVec<DemiBuffer, MAX_BATCH_SIZE_NUM_PACKETS>,
-    ) -> Result<(), Fail> {
+    pub fn push_checks(&self) -> Result<(), Fail> {
         // If the user is done sending (i.e. has called close on this connection), then they shouldn't be sending.
-        debug_assert!(cb.delivery.sender_fin_seq_no.is_none());
+        debug_assert!(self.sender_fin_seq_no.is_none());
 
         // TODO: We need to fix this the correct way: limit our send buffer size to the amount we're willing to buffer.
-        if cb.delivery.unsent_queue.len() > UNSENT_QUEUE_CUTOFF - 1 {
+        if self.unsent_queue.len() > UNSENT_QUEUE_CUTOFF - 1 {
             return Err(Fail::new(libc::EBUSY, "too many packets to send"));
         }
 
-        trace!("push(): total unsent segments={:?}", cb.delivery.unsent_queue.len());
+        trace!("push(): total unsent segments={:?}", self.unsent_queue.len());
+        Ok(())
+    }
+
+    // This function sends a list of packets (or FIN if empty) and waits for it to be acked.
+    pub async fn push_fin(
+        &mut self,
+        congestion_control: &CongestionControlState,
+        connection_management: &ConnectionManagementState,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+        runtime: &mut SharedDemiRuntime,
+    ) -> Result<(), Fail> {
+        self.push_checks()?;
 
         // Check if closing the socket and sending FIN.
-        if bufs.is_empty() {
-            // We can always send the FIN immediately.
-            cb.delivery.sender_fin_seq_no = Some(cb.delivery.unsent_next_seq_no);
-            cb.delivery.unsent_next_seq_no = cb.delivery.unsent_next_seq_no + 1.into();
-            Self::send_fin(cb, layer3_endpoint, runtime.now())?;
-        } else {
-            for mut buf in bufs.into_iter() {
-                cb.delivery.unsent_next_seq_no = cb.delivery.unsent_next_seq_no + (buf.len() as u32).into();
-                if cb.flow_control.send_window.get() > 0 {
-                    cb.send_segment(layer3_endpoint, runtime.now(), &mut buf);
+        // We can always send the FIN immediately.
+        self.sender_fin_seq_no = Some(self.unsent_next_seq_no);
+        self.unsent_next_seq_no = self.unsent_next_seq_no + 1.into();
+        self.send_fin(
+            congestion_control,
+            connection_management,
+            layer3_endpoint,
+            runtime.now(),
+        )?;
 
-                    if !buf.is_empty() {
-                        cb.delivery.unsent_queue.push(buf);
-                    }
-                }
-            }
-        }
-
-        if !cb.delivery.unacked_queue.is_empty() {
-            trace!("push(): total unacked segments={:?}", cb.delivery.unacked_queue.len());
+        if !self.unacked_queue.is_empty() {
+            trace!("push(): total unacked segments={:?}", self.unacked_queue.len());
         }
 
         // Wait until the sequnce number of the pushed buffer is acknowledged.
-        let mut send_unacked_watched = cb.delivery.send_unacked.clone();
-        let ack_seq_no = cb.delivery.unsent_next_seq_no;
+        let mut send_unacked_watched = self.send_unacked.clone();
+        let ack_seq_no = self.unsent_next_seq_no;
+        debug_assert!(send_unacked_watched.get() < ack_seq_no);
+        while send_unacked_watched.get() < ack_seq_no {
+            send_unacked_watched.wait_for_change(None).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn push_buf(
+        &mut self,
+        flow_control: &FlowControlState,
+        congestion_control: &CongestionControlState,
+        connection_management: &ConnectionManagementState,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+        runtime: &mut SharedDemiRuntime,
+        mut buf: DemiBuffer,
+        max_frame_size_bytes: usize,
+    ) -> Result<(), Fail> {
+        self.unsent_next_seq_no = self.unsent_next_seq_no + (buf.len() as u32).into();
+        if flow_control.send_window.get() > 0 {
+            self.transmit_segment(
+                &connection_management,
+                &congestion_control,
+                layer3_endpoint,
+                runtime.now(),
+                &mut buf,
+                max_frame_size_bytes,
+            );
+
+            if !buf.is_empty() {
+                self.unsent_queue.push(buf);
+            }
+        }
+
+        if !self.unacked_queue.is_empty() {
+            trace!("push(): total unacked segments={:?}", self.unacked_queue.len());
+        }
+
+        // Wait until the sequnce number of the pushed buffer is acknowledged.
+        let mut send_unacked_watched = self.send_unacked.clone();
+        let ack_seq_no = self.unsent_next_seq_no;
         debug_assert!(send_unacked_watched.get() < ack_seq_no);
         while send_unacked_watched.get() < ack_seq_no {
             send_unacked_watched.wait_for_change(None).await?;
@@ -285,28 +324,31 @@ impl OrderedDeliveryState {
         }
     }
 
-    fn send_fin(cb: &mut ControlBlock, layer3_endpoint: &mut SharedLayer3Endpoint, now: Instant) -> Result<(), Fail> {
-        debug_assert!(cb.delivery.sender_fin_seq_no.is_some());
+    fn send_fin(
+        &mut self,
+        congestion_control: &CongestionControlState,
+        connection_management: &ConnectionManagementState,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+        now: Instant,
+    ) -> Result<(), Fail> {
+        debug_assert!(self.sender_fin_seq_no.is_some());
 
-        let mut header = cb
-            .delivery
-            .tcp_header(&cb.connection_management, cb.delivery.sender_fin_seq_no);
+        let mut header = self.tcp_header(connection_management, self.sender_fin_seq_no);
         header.fin = true;
-        cb.delivery
-            .emit(&cb.connection_management, layer3_endpoint, header, None);
+        self.emit(connection_management, layer3_endpoint, header, None);
         // Update SND.NXT.
-        cb.delivery.send_next_seq_no.modify(|s| s + 1.into());
+        self.send_next_seq_no.modify(|s| s + 1.into());
 
         // Add the FIN to our unacknowledged queue.
         let unacked_segment = UnackedSegment {
             bytes: None,
             initial_tx: Some(now),
         };
-        cb.delivery.unacked_queue.push(unacked_segment);
+        self.unacked_queue.push(unacked_segment);
         // Set the retransmit timer.
-        if cb.delivery.retransmit_deadline_time_secs.get().is_none() {
-            let rto = cb.congestion_control.rto_calculator.rto();
-            cb.delivery.retransmit_deadline_time_secs.set(Some(now + rto));
+        if self.retransmit_deadline_time_secs.get().is_none() {
+            let rto = congestion_control.rto_calculator.rto();
+            self.retransmit_deadline_time_secs.set(Some(now + rto));
         }
         Ok(())
     }
@@ -1253,37 +1295,6 @@ impl OrderedDeliveryState {
         // imposes a limit on the number of entries.  Do we need this?  Presumably for attack mitigation?
         while self.out_of_order_frames.len() > MAX_OUT_OF_ORDER_SIZE_FRAMES {
             self.out_of_order_frames.pop_back();
-        }
-    }
-
-    pub async fn acknowledger(
-        cb: &mut ControlBlock,
-        layer3_endpoint: &mut SharedLayer3Endpoint,
-    ) -> Result<Never, Fail> {
-        let mut ack_deadline = cb.delivery.ack_deadline_time_secs.clone();
-        let mut deadline = ack_deadline.get();
-
-        loop {
-            // TODO: Implement TCP delayed ACKs, subject to restrictions from RFC 1122
-            // - TCP should implement a delayed ACK
-            // - The delay must be less than 500ms
-            // - For a stream of full-sized segments, there should be an ack for every other segment.
-            // TODO: Implement SACKs
-            match ack_deadline.wait_for_change_until(deadline).await {
-                Ok(value) => {
-                    deadline = value;
-                    continue;
-                },
-                Err(Fail { errno, cause: _ }) if errno == libc::ETIMEDOUT => {
-                    cb.delivery.send_ack(&cb.connection_management, layer3_endpoint);
-                    deadline = ack_deadline.get();
-                },
-                Err(_) => {
-                    unreachable!(
-                        "either the ack deadline changed or the deadline passed, no other errors are possible!"
-                    )
-                },
-            }
         }
     }
 }

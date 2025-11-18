@@ -218,13 +218,7 @@ impl SharedEstablishedSocket {
         let wait_for_fin = pin!(me3.control_block.delivery.wait_for_fin().fuse());
         let mut runtime = self.runtime.clone();
         let mut layer3_endpoint = self.layer3_endpoint.clone();
-        let push_fin_and_wait_for_ack = pin!(OrderedDeliveryState::push(
-            &mut me2.control_block,
-            &mut layer3_endpoint,
-            &mut runtime,
-            ArrayVec::new()
-        )
-        .fuse());
+        let push_fin_and_wait_for_ack = pin!(me2.control_block.push_fin(&mut layer3_endpoint, &mut runtime,).fuse());
         let (result1, result2) = join!(wait_for_fin, push_fin_and_wait_for_ack);
         result1?;
         result2?;
@@ -252,13 +246,7 @@ impl SharedEstablishedSocket {
         // 1. Send FIN and wait for ack before closing.
         let mut runtime = self.runtime.clone();
         let mut layer3_endpoint = self.layer3_endpoint.clone();
-        OrderedDeliveryState::push(
-            &mut self.control_block,
-            &mut layer3_endpoint,
-            &mut runtime,
-            ArrayVec::new(),
-        )
-        .await?;
+        self.control_block.push_fin(&mut layer3_endpoint, &mut runtime).await?;
         debug_assert_eq!(self.control_block.connection_management.state, State::Closed);
 
         Ok(())
@@ -267,7 +255,10 @@ impl SharedEstablishedSocket {
     pub async fn push(&mut self, bufs: ArrayVec<DemiBuffer, MAX_BATCH_SIZE_NUM_PACKETS>) -> Result<(), Fail> {
         let mut runtime = self.runtime.clone();
         let mut layer3_endpoint = self.layer3_endpoint.clone();
-        OrderedDeliveryState::push(&mut self.control_block, &mut layer3_endpoint, &mut runtime, bufs).await
+        for buf in bufs.into_iter() {
+            ControlBlock::push(&mut self.control_block, &mut layer3_endpoint, &mut runtime, buf).await?;
+        }
+        Ok(())
     }
 
     pub async fn pop(&mut self, size: Option<usize>) -> Result<ArrayVec<DemiBuffer, MAX_BATCH_SIZE_NUM_PACKETS>, Fail> {
@@ -285,7 +276,7 @@ impl SharedEstablishedSocket {
         let mut me = self.clone();
         let acknowledger = async_timer!("tcp::established::background::acknowledger", async {
             let mut layer3_endpoint = me.layer3_endpoint.clone();
-            OrderedDeliveryState::acknowledger(&mut me.control_block, &mut layer3_endpoint).await
+            me.control_block.acknowledger(&mut layer3_endpoint).await
         })
         .fuse();
         pin_mut!(acknowledger);
