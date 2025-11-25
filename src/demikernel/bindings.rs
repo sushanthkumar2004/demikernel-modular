@@ -1022,6 +1022,23 @@ mod test {
 
     #[test]
     fn test_set_and_get_linger() -> anyhow::Result<()> {
+        // Set the required environment variables for the test
+        std::env::set_var("LIBOS", "catnap");
+        
+        // Create a minimal config file for the test
+        let config_content = r#"
+local_ipv4_addr: 127.0.0.1
+arp_table: []
+disable_arp: true
+use_jumbo_frames: false
+mss: 1500
+tcp_checksum_offload: false
+udp_checksum_offload: false
+"#;
+        let config_path = "/tmp/test_config.yaml";
+        std::fs::write(config_path, config_content)?;
+        std::env::set_var("CONFIG_PATH", config_path);
+        
         use crate::runtime::types::demi_args_t;
         let args = demi_args_t::default();
         let result = unsafe { demi_init(&args) };

@@ -12,6 +12,7 @@ pub mod ctrlblk;
 mod flow_control_state;
 mod ordered_delivery_state;
 mod rto;
+pub mod tcp_events;
 
 //======================================================================================================================
 // Imports
@@ -210,7 +211,7 @@ impl SharedEstablishedSocket {
 
     async fn local_close(&mut self) -> Result<(), Fail> {
         // 1. Start close protocol by setting state and sending FIN.
-        self.control_block.connection_management.state = State::FinWait1;
+        self.control_block.connection_management.on_local_close_start()?;
 
         // 2. Wait for FIN and FIN ack.
         let mut me2 = self.clone();
@@ -242,13 +243,13 @@ impl SharedEstablishedSocket {
             .get_linger()
             .unwrap_or(MSL * 2);
         yield_with_timeout(timeout).await;
-        self.control_block.connection_management.state = State::Closed;
+        self.control_block.connection_management.on_timewait_timeout()?;
         Ok(())
     }
 
     async fn remote_already_closed(&mut self) -> Result<(), Fail> {
         // 0. Move state forward
-        self.control_block.connection_management.state = State::LastAck;
+        self.control_block.connection_management.on_remote_close_start()?;
         // 1. Send FIN and wait for ack before closing.
         let mut runtime = self.runtime.clone();
         let mut layer3_endpoint = self.layer3_endpoint.clone();

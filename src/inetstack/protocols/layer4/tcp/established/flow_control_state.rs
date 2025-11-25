@@ -55,6 +55,12 @@ impl FlowControlState {
             );
         }
     }
+
+    /// Component-specific event handler for ACK received.
+    /// This method only modifies FlowControlState and enforces component isolation.
+    pub fn on_ack_received(&mut self, header: &TcpHeader) {
+        self.update_send_window(header);
+    }
 }
 
 impl fmt::Debug for FlowControlState {

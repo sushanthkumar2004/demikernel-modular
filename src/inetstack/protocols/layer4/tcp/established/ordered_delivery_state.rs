@@ -567,7 +567,10 @@ impl OrderedDeliveryState {
         }
     }
 
-    pub fn process_ack_state_change(
+    /// Component-specific event handler for ACK received.
+    /// This method only modifies OrderedDeliveryState and enforces component isolation.
+    /// Reads from congestion_control_state but only writes to self.
+    pub fn on_ack_received(
         &mut self,
         congestion_control_state: &CongestionControlState,
         header: &TcpHeader,
@@ -790,7 +793,7 @@ impl OrderedDeliveryState {
             )?;
         }
         // Deal with FIN flag, saving the FIN for later if it is out of order.
-        Self::check_and_process_fin(control_block, &header, seg_end, layer3_endpoint)?;
+        super::tcp_events::dispatch_fin_event(control_block, &header, seg_end, layer3_endpoint)?;
 
         // We should ACK this segment, preferably via piggybacking on a response.
         if control_block.delivery.ack_deadline_time_secs.get().is_none() {
@@ -810,62 +813,44 @@ impl OrderedDeliveryState {
         Ok(())
     }
 
-    // This function causes a EOF to be returned to the user. We also know that there will be no more incoming
-    // data after this sequence number.
-    fn check_and_process_fin(
-        cb: &mut ControlBlock,
-        header: &TcpHeader,
-        seg_end: SeqNumber,
-        layer3_endpoint: &mut SharedLayer3Endpoint,
-    ) -> Result<(), Fail> {
-        if header.fin {
-            match cb.delivery.recv_fin_seq_no.get() {
-                // We've already received this FIN.
-                Some(seq_no) if seg_end != seq_no => {
-                    warn!(
-                        "Received a FIN with a different sequence number, ignoring. previous={:?} new={:?}",
-                        seq_no, seg_end,
-                    )
-                },
-                Some(_) => (),
-                None => {
-                    trace!("Received FIN");
-                    cb.delivery.recv_fin_seq_no.set(seg_end.into());
-                },
-            }
-        };
+    /// Component-specific event handler for FIN received.
+    /// Updates recv_fin_seq_no if this is the first time we see the FIN.
+    pub fn on_fin_received(&mut self, seg_end: SeqNumber) {
+        match self.recv_fin_seq_no.get() {
+            // We've already received this FIN.
+            Some(seq_no) if seg_end != seq_no => {
+                warn!(
+                    "Received a FIN with a different sequence number, ignoring. previous={:?} new={:?}",
+                    seq_no, seg_end,
+                )
+            },
+            Some(_) => (),
+            None => {
+                trace!("Received FIN");
+                self.recv_fin_seq_no.set(Some(seg_end));
+            },
+        }
+    }
 
-        // Have we received all data before the FIN?
-        if cb
-            .delivery
-            .recv_fin_seq_no
+    /// Checks if we have received all data up to the FIN sequence number.
+    pub fn is_fin_complete(&self) -> bool {
+        self.recv_fin_seq_no
             .get()
-            .is_some_and(|seq_no| seq_no == cb.delivery.receive_next_seq_no)
-        {
-            let state = match cb.connection_management.state {
-                State::Established => State::CloseWait,
-                State::FinWait1 => State::Closing,
-                State::FinWait2 => State::TimeWait,
-                state => unreachable!("Cannot be in any other state at this point: {:?}", state),
-            };
-            cb.connection_management.state = state;
-            cb.delivery.pop_queue.push(DemiBuffer::new(0));
-            debug_assert_eq!(
-                cb.delivery.receive_next_seq_no,
-                cb.delivery.recv_fin_seq_no.get().unwrap()
-            );
-            // Reset it to wake up any close coroutines waiting for FIN to arrive.
-            cb.delivery.recv_fin_seq_no.set(Some(cb.delivery.receive_next_seq_no));
-            // Move RECV_NXT over the FIN.
-            cb.delivery.receive_next_seq_no = cb.delivery.receive_next_seq_no + 1.into();
-        }
+            .is_some_and(|seq_no| seq_no == self.receive_next_seq_no)
+    }
 
-        // Have we processed all of the data and the FIN?
-        if header.fin {
-            cb.delivery.send_ack(&cb.connection_management, layer3_endpoint);
-        }
-
-        Ok(())
+    /// Component-specific event handler for when FIN processing is complete.
+    /// Pushes EOF to pop_queue and increments receive_next_seq_no.
+    pub fn on_fin_processed(&mut self) {
+        self.pop_queue.push(DemiBuffer::new(0));
+        debug_assert_eq!(
+            self.receive_next_seq_no,
+            self.recv_fin_seq_no.get().unwrap()
+        );
+        // Reset it to wake up any close coroutines waiting for FIN to arrive.
+        self.recv_fin_seq_no.set(Some(self.receive_next_seq_no));
+        // Move RECV_NXT over the FIN.
+        self.receive_next_seq_no = self.receive_next_seq_no + 1.into();
     }
 
     pub fn receive_window_size(&self) -> u32 {

@@ -23,7 +23,22 @@ const SGA_SIZE_BIG: usize = 1280;
 //======================================================================================================================
 
 /// Tests for a single scatter-gather array allocation and deallocation.
-fn do_test_unit_sga_alloc_free_single(size: usize) -> Result<()> {
+fn do_test_unit_sga_alloc_free_single(size: usize, test_name: &str) -> Result<()> {
+    // Set up required environment variables for the test
+    std::env::set_var("LIBOS", "catnap");
+    let config_content = r#"
+local_ipv4_addr: 127.0.0.1
+arp_table: []
+disable_arp: true
+use_jumbo_frames: false
+mss: 1500
+tcp_checksum_offload: false
+udp_checksum_offload: false
+"#;
+    let config_path = format!("/tmp/test_sga_config_{}.yaml", test_name);
+    std::fs::write(&config_path, config_content)?;
+    std::env::set_var("CONFIG_PATH", &config_path);
+    
     let libos_name: LibOSName = match LibOSName::from_env() {
         Ok(libos_name) => libos_name.into(),
         Err(e) => anyhow::bail!("{:?}", e),
@@ -46,13 +61,13 @@ fn do_test_unit_sga_alloc_free_single(size: usize) -> Result<()> {
 /// Tests a single allocation and deallocation of a small scatter-gather array.
 #[test]
 fn test_unit_sga_alloc_free_single_small() -> Result<()> {
-    do_test_unit_sga_alloc_free_single(SGA_SIZE_SMALL)
+    do_test_unit_sga_alloc_free_single(SGA_SIZE_SMALL, "single_small")
 }
 
 /// Tests a single allocation and deallocation of a big scatter-gather array.
 #[test]
 fn test_unit_sga_alloc_free_single_big() -> Result<()> {
-    do_test_unit_sga_alloc_free_single(SGA_SIZE_BIG)
+    do_test_unit_sga_alloc_free_single(SGA_SIZE_BIG, "single_big")
 }
 
 //======================================================================================================================
@@ -60,7 +75,22 @@ fn test_unit_sga_alloc_free_single_big() -> Result<()> {
 //======================================================================================================================
 
 /// Tests looped allocation and deallocation of scatter-gather arrays.
-fn do_test_unit_sga_alloc_free_loop_tight(size: usize) -> Result<()> {
+fn do_test_unit_sga_alloc_free_loop_tight(size: usize, test_name: &str) -> Result<()> {
+    // Set up required environment variables for the test
+    std::env::set_var("LIBOS", "catnap");
+    let config_content = r#"
+local_ipv4_addr: 127.0.0.1
+arp_table: []
+disable_arp: true
+use_jumbo_frames: false
+mss: 1500
+tcp_checksum_offload: false
+udp_checksum_offload: false
+"#;
+    let config_path = format!("/tmp/test_sga_config_{}.yaml", test_name);
+    std::fs::write(&config_path, config_content)?;
+    std::env::set_var("CONFIG_PATH", &config_path);
+    
     let libos_name: LibOSName = match LibOSName::from_env() {
         Ok(libos_name) => libos_name.into(),
         Err(e) => anyhow::bail!("{:?}", e),
@@ -96,13 +126,13 @@ fn do_test_unit_sga_alloc_free_loop_tight(size: usize) -> Result<()> {
 /// Tests looped allocation and deallocation of small scatter-gather arrays.
 #[test]
 fn test_unit_sga_alloc_free_loop_tight_small() -> Result<()> {
-    do_test_unit_sga_alloc_free_loop_tight(SGA_SIZE_SMALL)
+    do_test_unit_sga_alloc_free_loop_tight(SGA_SIZE_SMALL, "loop_tight_small")
 }
 
 /// Tests looped allocation and deallocation of big scatter-gather arrays.
 #[test]
 fn test_unit_sga_alloc_free_loop_tight_big() -> Result<()> {
-    do_test_unit_sga_alloc_free_loop_tight(SGA_SIZE_BIG)
+    do_test_unit_sga_alloc_free_loop_tight(SGA_SIZE_BIG, "loop_tight_big")
 }
 
 //======================================================================================================================
@@ -110,7 +140,22 @@ fn test_unit_sga_alloc_free_loop_tight_big() -> Result<()> {
 //======================================================================================================================
 
 /// Tests decoupled looped allocation and deallocation of scatter-gather arrays.
-fn do_test_unit_sga_alloc_free_loop_decoupled(size: usize) -> Result<()> {
+fn do_test_unit_sga_alloc_free_loop_decoupled(size: usize, test_name: &str) -> Result<()> {
+    // Set up required environment variables for the test
+    std::env::set_var("LIBOS", "catnap");
+    let config_content = r#"
+local_ipv4_addr: 127.0.0.1
+arp_table: []
+disable_arp: true
+use_jumbo_frames: false
+mss: 1500
+tcp_checksum_offload: false
+udp_checksum_offload: false
+"#;
+    let config_path = format!("/tmp/test_sga_config_{}.yaml", test_name);
+    std::fs::write(&config_path, config_content)?;
+    std::env::set_var("CONFIG_PATH", &config_path);
+    
     let mut sgas: Vec<demi_sgarray_t> = Vec::with_capacity(1_000);
     let libos_name: LibOSName = match LibOSName::from_env() {
         Ok(libos_name) => libos_name.into(),
@@ -163,11 +208,11 @@ fn do_test_unit_sga_alloc_free_loop_decoupled(size: usize) -> Result<()> {
 /// Tests decoupled looped allocation and deallocation of small scatter-gather arrays.
 #[test]
 fn test_unit_sga_alloc_free_loop_decoupled_small() -> Result<()> {
-    do_test_unit_sga_alloc_free_loop_decoupled(SGA_SIZE_SMALL)
+    do_test_unit_sga_alloc_free_loop_decoupled(SGA_SIZE_SMALL, "loop_decoupled_small")
 }
 
 /// Tests decoupled looped allocation and deallocation of big scatter-gather arrays.
 #[test]
 fn test_unit_sga_alloc_free_loop_decoupled_big() -> Result<()> {
-    do_test_unit_sga_alloc_free_loop_decoupled(SGA_SIZE_BIG)
+    do_test_unit_sga_alloc_free_loop_decoupled(SGA_SIZE_BIG, "loop_decoupled_big")
 }

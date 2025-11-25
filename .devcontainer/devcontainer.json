@@ -1,0 +1,35 @@
+{
+  "name": "Demikernel Development",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "demikernel-dev",
+  "workspaceFolder": "/workspace",
+  
+  // Configure VS Code settings for the container
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "rust-analyzer.checkOnSave.command": "clippy",
+        "rust-analyzer.cargo.features": "all",
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        }
+      },
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "serayuzgur.crates",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  },
+  
+  // Use 'forwardPorts' to make a list of ports inside the container available locally
+  "forwardPorts": [],
+  
+  // Use 'postCreateCommand' to run commands after the container is created
+  "postCreateCommand": "rustc --version && cargo --version",
+  
+  // Comment out to connect as root instead
+  "remoteUser": "root"
+}

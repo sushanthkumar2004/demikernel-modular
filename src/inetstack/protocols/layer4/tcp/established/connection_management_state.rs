@@ -9,7 +9,7 @@ use crate::{
             SeqNumber,
         },
     },
-    runtime::network::socket::option::TcpSocketOptions,
+    runtime::{fail::Fail, network::socket::option::TcpSocketOptions},
 };
 
 /// State block representing connection management parameters in a TCP connection.
@@ -64,7 +64,10 @@ impl ConnectionManagementState {
         };
     }
 
-    pub fn process_ack_state_change(&mut self, delivery_state: &OrderedDeliveryState, header: &TcpHeader) {
+    /// Component-specific event handler for ACK received in FIN_WAIT_1 state.
+    /// This method only modifies ConnectionManagementState and enforces component isolation.
+    /// Reads from delivery_state but only writes to self.state.
+    pub fn on_ack_in_finwait1(&mut self, delivery_state: &OrderedDeliveryState, header: &TcpHeader) {
         let send_unacknowledged = delivery_state.send_unacked.get();
 
         // Check if ACK asserted something new
@@ -103,10 +106,79 @@ impl ConnectionManagementState {
         } else {
             // Duplicate ACK received.
             trace!(
-                "ConnectionManagementState::process_ack_state_change(): received duplicate ack ({:?}); unacked len = {:?}",
+                "ConnectionManagementState::on_ack_in_finwait1(): received duplicate ack ({:?}); unacked len = {:?}",
                 header.ack_num,
                 delivery_state.unacked_queue.len()
             );
         }
+    }
+
+    /// Component-specific event handler for ACK received in CLOSING state.
+    /// This method only modifies ConnectionManagementState and enforces component isolation.
+    pub fn on_ack_in_closing(&mut self, delivery_state: &OrderedDeliveryState, header: &TcpHeader) {
+        // Same logic as FinWait1 - check if FIN is ACKed
+        self.on_ack_in_finwait1(delivery_state, header);
+    }
+
+    /// Component-specific event handler for ACK received in LAST_ACK state.
+    /// This method only modifies ConnectionManagementState and enforces component isolation.
+    pub fn on_ack_in_lastack(&mut self, delivery_state: &OrderedDeliveryState, header: &TcpHeader) {
+        // Same logic as FinWait1 - check if FIN is ACKed
+        self.on_ack_in_finwait1(delivery_state, header);
+    }
+
+    /// Component-specific event handler for FIN received in ESTABLISHED state.
+    pub fn on_fin_in_established(&mut self) -> Result<(), Fail> {
+        self.state = State::CloseWait;
+        Ok(())
+    }
+
+    /// Component-specific event handler for FIN received in FIN_WAIT_1 state.
+    pub fn on_fin_in_finwait1(&mut self) -> Result<(), Fail> {
+        self.state = State::Closing;
+        Ok(())
+    }
+
+    /// Component-specific event handler for FIN received in FIN_WAIT_2 state.
+    pub fn on_fin_in_finwait2(&mut self) -> Result<(), Fail> {
+        self.state = State::TimeWait;
+        Ok(())
+    }
+
+    /// Component-specific event handler for initiating local close (active close).
+    /// Transitions from Established to FinWait1.
+    pub fn on_local_close_start(&mut self) -> Result<(), Fail> {
+        if self.state != State::Established {
+            return Err(Fail::new(libc::EBADF, "socket is not in Established state"));
+        }
+        self.state = State::FinWait1;
+        Ok(())
+    }
+
+    /// Component-specific event handler for initiating remote close (passive close).
+    /// Transitions from CloseWait to LastAck.
+    pub fn on_remote_close_start(&mut self) -> Result<(), Fail> {
+        if self.state != State::CloseWait {
+            return Err(Fail::new(libc::EBADF, "socket is not in CloseWait state"));
+        }
+        self.state = State::LastAck;
+        Ok(())
+    }
+
+    /// Component-specific event handler for TIME_WAIT timeout.
+    /// Transitions from TimeWait to Closed.
+    pub fn on_timewait_timeout(&mut self) -> Result<(), Fail> {
+        if self.state != State::TimeWait {
+            return Err(Fail::new(libc::EBADF, "socket is not in TimeWait state"));
+        }
+        self.state = State::Closed;
+        Ok(())
+    }
+
+    /// Legacy method - kept for backward compatibility during refactoring.
+    /// Use component-specific on_ack_in_* methods instead.
+    #[deprecated(note = "Use on_ack_in_finwait1, on_ack_in_closing, or on_ack_in_lastack instead")]
+    pub fn process_ack_state_change(&mut self, delivery_state: &OrderedDeliveryState, header: &TcpHeader) {
+        self.on_ack_in_finwait1(delivery_state, header);
     }
 }

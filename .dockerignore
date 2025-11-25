@@ -1,0 +1,11 @@
+# Don't copy these into the Docker image
+target/
+.git/
+.github/
+*.log
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

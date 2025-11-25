@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  demikernel-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: demikernel-dev
+    volumes:
+      # Mount the source code so changes are reflected
+      - .:/workspace
+      # Cache cargo registry and build artifacts
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target:/workspace/target
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  target:

@@ -76,16 +76,21 @@ impl ControlBlock {
         }
     }
 
+    /// Legacy privileged control path method - DEPRECATED.
+    /// Use tcp_events::dispatch_ack_event() instead.
+    /// This method has write access to all components, violating component isolation.
+    #[deprecated(note = "Use tcp_events::dispatch_ack_event() instead - this method violates component isolation")]
     fn process_ack(&mut self, header: &TcpHeader, now: Instant) {
         // Check and update send window if necessary.
         self.flow_control.update_send_window(header);
+        #[allow(deprecated)]
         self.connection_management
             .process_ack_state_change(&self.delivery, header);
         self.congestion_control
-            .process_ack_state_change(&self.delivery, header, now);
+            .on_ack_received(&self.delivery, header, now);
 
         self.delivery
-            .process_ack_state_change(&self.congestion_control, header, now);
+            .on_ack_received(&self.congestion_control, header, now);
     }
 
     // Check the ACK bit.
@@ -99,7 +104,9 @@ impl ControlBlock {
 
         // TODO: RFC 5961 "Blind Data Injection Attack" prevention would have us perform additional ACK validation
         // checks here.
-        self.process_ack(header, now);
+        
+        // Use the new dispatcher instead of privileged process_ack
+        super::tcp_events::dispatch_ack_event(self, header, now);
 
         Ok(())
     }

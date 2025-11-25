@@ -39,7 +39,10 @@ impl CongestionControlState {
         }
     }
 
-    pub fn process_ack_state_change(
+    /// Component-specific event handler for ACK received.
+    /// This method only modifies CongestionControlState and enforces component isolation.
+    /// Reads from delivery_state but only writes to self.
+    pub fn on_ack_received(
         &mut self,
         delivery_state: &OrderedDeliveryState,
         header: &TcpHeader,
