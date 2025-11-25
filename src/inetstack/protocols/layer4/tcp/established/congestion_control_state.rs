@@ -85,6 +85,13 @@ impl CongestionControlState {
         }
     }
 
+    /// Component-specific event handler for SYN received during handshake.
+    /// No-op for now, kept for symmetry with other components.
+    pub fn on_syn_received(&mut self, _mss: usize) {
+        // Congestion control is already initialized in new()
+        // This is a no-op for now, but kept for symmetry
+    }
+
     pub fn get_open_window_size_bytes(
         &mut self,
         delivery: &OrderedDeliveryState,

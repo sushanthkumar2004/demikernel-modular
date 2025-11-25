@@ -56,6 +56,19 @@ impl FlowControlState {
         }
     }
 
+    /// Component-specific event handler for SYN received during handshake.
+    /// Sets window sizes and MSS from SYN options.
+    pub fn on_syn_received(
+        &mut self,
+        remote_window_size: u32,
+        remote_window_scale: u8,
+        mss: usize,
+    ) {
+        self.send_window.set(remote_window_size);
+        self.send_window_scale_shift_bits = remote_window_scale;
+        self.mss = mss;
+    }
+
     /// Component-specific event handler for ACK received.
     /// This method only modifies FlowControlState and enforces component isolation.
     pub fn on_ack_received(&mut self, header: &TcpHeader) {

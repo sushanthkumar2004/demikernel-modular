@@ -813,6 +813,19 @@ impl OrderedDeliveryState {
         Ok(())
     }
 
+    /// Component-specific event handler for SYN received during handshake.
+    /// Sets initial sequence numbers for both send and receive sides.
+    pub fn on_syn_received(&mut self, remote_isn: SeqNumber, local_isn: SeqNumber) {
+        // Set receive sequence numbers
+        self.receive_next_seq_no = remote_isn + SeqNumber::from(1);
+        self.reader_next_seq_no = remote_isn + SeqNumber::from(1);
+        
+        // Set send sequence numbers
+        self.send_unacked.set(local_isn + SeqNumber::from(1));
+        self.send_next_seq_no.set(local_isn + SeqNumber::from(1));
+        self.unsent_next_seq_no = local_isn + SeqNumber::from(1);
+    }
+
     /// Component-specific event handler for FIN received.
     /// Updates recv_fin_seq_no if this is the first time we see the FIN.
     pub fn on_fin_received(&mut self, seg_end: SeqNumber) {

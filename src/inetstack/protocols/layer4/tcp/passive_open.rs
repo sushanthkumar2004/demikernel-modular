@@ -386,7 +386,7 @@ impl SharedPassiveSocket {
             }
         };
 
-        // Calculate the window.
+        // Calculate local window parameters
         let (local_window_scale_bits, remote_window_scale_bits): (u8, u8) = match remote_window_scale_bits {
             Some(remote_window_scale) => {
                 if (remote_window_scale as usize) > MAX_WINDOW_SCALE {
@@ -402,48 +402,83 @@ impl SharedPassiveSocket {
             None => (0, 0),
         };
 
-        // Expect is safe here because the window size is a 16-bit unsigned integer and MAX_WINDOW_SCALE is 14, so it is impossible to overflow the 32-bit
-        debug_assert!((remote_window_scale_bits as usize) <= MAX_WINDOW_SCALE);
-        let remote_window_size_bytes: u32 = expect_some!(
-            (tcp_hdr.window_size as u32).checked_shl(remote_window_scale_bits as u32),
-            "Window size overflow"
-        );
-        // Expect is safe here because the receive window size is a 16-bit unsigned integer and MAX_WINDOW_SCALE is 14,
-        // so it is impossible to overflow the 32-bit unsigned int.
+        // Calculate local window size
         debug_assert!((local_window_scale_bits as usize) <= MAX_WINDOW_SCALE);
         let local_window_size_bytes: u32 = expect_some!(
             (self.tcp_config.get_receive_window_size() as u32).checked_shl(local_window_scale_bits as u32),
             "Window size overflow"
         );
-        info!(
-            "Window sizes: local {} bytes, remote {} bytes",
-            local_window_size_bytes, remote_window_size_bytes
-        );
-        info!(
-            "Window scale: local {}, remote {}",
-            local_window_scale_bits, remote_window_scale_bits
-        );
 
-        // Check if there is data and if so, pass it along to the established header.
-        let data_with_ack: Option<(TcpHeader, DemiBuffer)> = if buf.is_empty() { None } else { Some((tcp_hdr, buf)) };
-        let new_socket: SharedEstablishedSocket = SharedEstablishedSocket::new(
-            self.local,
-            remote,
-            self.runtime.clone(),
-            self.layer3_endpoint.clone(),
-            data_with_ack,
-            self.tcp_config.clone(),
-            self.socket_options,
+        // Create ControlBlock components
+        use crate::inetstack::protocols::layer4::tcp::established::{
+            congestion_control_state::CongestionControlState,
+            connection_management_state::ConnectionManagementState,
+            ctrlblk::ControlBlock,
+            flow_control_state::FlowControlState,
+            ordered_delivery_state::OrderedDeliveryState,
+            tcp_events,
+        };
+
+        let delivery = OrderedDeliveryState::new(
+            local_isn + SeqNumber::from(1),
+            remote_isn + SeqNumber::from(1),
             remote_isn + SeqNumber::from(1),
             self.tcp_config.get_ack_delay_timeout(),
             local_window_size_bytes,
             local_window_scale_bits,
+        );
+
+        let flow_control = FlowControlState::new(
             local_isn + SeqNumber::from(1),
-            remote_window_size_bytes,
-            remote_window_scale_bits,
+            remote_isn + SeqNumber::from(1),
+            0, // Will be set by dispatcher
+            0, // Will be set by dispatcher
             mss,
-            congestion_control::None::new,
+        );
+
+        let connection_management = ConnectionManagementState::new(
+            self.local,
+            remote,
+            self.tcp_config.clone(),
+            self.socket_options,
+        );
+
+        let congestion_control_algorithm = congestion_control::None::new(
+            mss,
+            local_isn + SeqNumber::from(1),
             None,
+        );
+        let congestion_control = CongestionControlState::new(congestion_control_algorithm);
+
+        let mut cb = ControlBlock::new(
+            connection_management,
+            delivery,
+            flow_control,
+            congestion_control,
+        );
+
+        // Dispatch SYN event to initialize all components properly
+        // Note: We're creating a fake SYN header with the options we parsed earlier
+        let mut syn_hdr = TcpHeader::new(remote.port(), self.local.port());
+        syn_hdr.seq_num = remote_isn;
+        syn_hdr.window_size = tcp_hdr.window_size;
+        // Copy options from the original SYN
+        if remote_window_scale_bits > 0 {
+            syn_hdr.push_option(TcpOptions2::WindowScale(remote_window_scale_bits));
+        }
+        syn_hdr.push_option(TcpOptions2::MaximumSegmentSize(mss as u16));
+
+        tcp_events::dispatch_syn_event(&mut cb, remote, &syn_hdr, local_isn)?;
+
+        // Check if there is data and if so, pass it along to the established socket.
+        let data_with_ack: Option<(TcpHeader, DemiBuffer)> = if buf.is_empty() { None } else { Some((tcp_hdr, buf)) };
+
+        // Create established socket from ControlBlock
+        let new_socket = SharedEstablishedSocket::from_control_block(
+            cb,
+            self.runtime.clone(),
+            self.layer3_endpoint.clone(),
+            data_with_ack,
         )?;
 
         Ok(new_socket)

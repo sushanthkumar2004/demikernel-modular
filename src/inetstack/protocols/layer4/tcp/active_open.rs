@@ -139,6 +139,7 @@ impl SharedActiveOpenSocket {
         self.layer3_endpoint
             .transmit_tcp_packet_nonblocking(dst_ipv4_addr, pkt)?;
 
+        // Parse options and calculate window parameters
         let mut remote_window_scale_bits = None;
         let mut mss = FALLBACK_MSS;
         for option in header.iter_options() {
@@ -171,46 +172,70 @@ impl SharedActiveOpenSocket {
             None => (0, 0),
         };
 
-        // Expect is safe here because the receive window size is a 16-bit unsigned integer and MAX_WINDOW_SCALE is 14,
-        // so it is impossible to overflow the 32-bit unsigned int.
+        // Calculate local window size
         debug_assert!((local_window_scale_bits as usize) <= MAX_WINDOW_SCALE);
         let rx_window_size_bytes: u32 = expect_some!(
             (self.tcp_config.get_receive_window_size() as u32).checked_shl(local_window_scale_bits as u32),
             "Window size overflow"
         );
-        // Expect is safe here because the window size is a 16-bit unsigned integer and MAX_WINDOW_SCALE is 14, so it is impossible to overflow the 32-bit
-        debug_assert!((remote_window_scale_bits as usize) <= MAX_WINDOW_SCALE);
-        let tx_window_size_bytes: u32 = expect_some!(
-            (header.window_size as u32).checked_shl(remote_window_scale_bits as u32),
-            "Window size overflow"
-        );
 
-        info!(
-            "Window sizes: local {} bytes, remote {} bytes",
-            rx_window_size_bytes, tx_window_size_bytes
-        );
-        info!(
-            "Window scale: local {}, remote {}",
-            local_window_scale_bits, remote_window_scale_bits
-        );
-        SharedEstablishedSocket::new(
-            self.local,
-            self.remote,
-            self.runtime.clone(),
-            self.layer3_endpoint.clone(),
-            None,
-            self.tcp_config.clone(),
-            self.socket_options,
-            remote_seq_num,
+        // Create ControlBlock components
+        use crate::inetstack::protocols::layer4::tcp::established::{
+            congestion_control_state::CongestionControlState,
+            connection_management_state::ConnectionManagementState,
+            ctrlblk::ControlBlock,
+            flow_control_state::FlowControlState,
+            ordered_delivery_state::OrderedDeliveryState,
+            tcp_events,
+        };
+
+        let delivery = OrderedDeliveryState::new(
+            self.local_isn + SeqNumber::from(1),
+            header.seq_num + SeqNumber::from(1),
+            header.seq_num + SeqNumber::from(1),
             self.tcp_config.get_ack_delay_timeout(),
             rx_window_size_bytes,
             local_window_scale_bits,
-            expected_seq,
-            tx_window_size_bytes,
-            remote_window_scale_bits,
+        );
+
+        let flow_control = FlowControlState::new(
+            self.local_isn + SeqNumber::from(1),
+            header.seq_num + SeqNumber::from(1),
+            0, // Will be set by dispatcher
+            0, // Will be set by dispatcher
             mss,
-            congestion_control::None::new,
+        );
+
+        let connection_management = ConnectionManagementState::new(
+            self.local,
+            self.remote,
+            self.tcp_config.clone(),
+            self.socket_options,
+        );
+
+        let congestion_control_algorithm = congestion_control::None::new(
+            mss,
+            self.local_isn + SeqNumber::from(1),
             None,
+        );
+        let congestion_control = CongestionControlState::new(congestion_control_algorithm);
+
+        let mut cb = ControlBlock::new(
+            connection_management,
+            delivery,
+            flow_control,
+            congestion_control,
+        );
+
+        // Dispatch SYN+ACK event to initialize all components properly
+        tcp_events::dispatch_synack_event(&mut cb, &header, self.local_isn)?;
+
+        // Create established socket from ControlBlock
+        SharedEstablishedSocket::from_control_block(
+            cb,
+            self.runtime.clone(),
+            self.layer3_endpoint.clone(),
+            None, // No data with ACK in active open
         )
     }
 

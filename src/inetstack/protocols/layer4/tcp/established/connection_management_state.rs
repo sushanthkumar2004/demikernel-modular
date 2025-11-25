@@ -145,6 +145,20 @@ impl ConnectionManagementState {
         Ok(())
     }
 
+    /// Component-specific event handler for SYN received in LISTEN state (passive open).
+    /// Sets the remote endpoint.
+    pub fn on_syn_in_listen(&mut self, remote: SocketAddrV4) -> Result<(), Fail> {
+        self.remote = remote;
+        Ok(())
+    }
+
+    /// Component-specific event handler for SYN+ACK received in SYN_SENT state (active open).
+    /// Transitions to ESTABLISHED state (implicitly - ControlBlock is being created).
+    pub fn on_synack_in_synsent(&mut self) -> Result<(), Fail> {
+        // No state change needed - we're creating the ControlBlock for ESTABLISHED
+        Ok(())
+    }
+
     /// Component-specific event handler for initiating local close (active close).
     /// Transitions from Established to FinWait1.
     pub fn on_local_close_start(&mut self) -> Result<(), Fail> {
