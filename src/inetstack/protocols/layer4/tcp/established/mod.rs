@@ -304,7 +304,7 @@ impl SharedEstablishedSocket {
         let sender = async_timer!("tcp::established::background::sender", async {
             let mut layer3_endpoint = me3.layer3_endpoint.clone();
             let mut runtime = me3.runtime.clone();
-            OrderedDeliveryState::background_sender(&mut me3.control_block, &mut layer3_endpoint, &mut runtime).await
+            ControlBlock::background_sender(&mut me3.control_block, &mut layer3_endpoint, &mut runtime).await
         })
         .fuse();
         pin_mut!(sender);

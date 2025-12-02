@@ -21,6 +21,7 @@ use crate::{
                     congestion_control_state::CongestionControlState,
                     connection_management_state::ConnectionManagementState,
                     ctrlblk::{ControlBlock, State},
+                    flow_control_state::FlowControlState,
                     MAX_WINDOW_SIZE_WITHOUT_SCALING, MAX_WINDOW_SIZE_WITH_SCALING,
                 },
                 header::TcpHeader,
@@ -103,7 +104,7 @@ pub struct OrderedDeliveryState {
 
     // This is the send buffer (user data we do not yet have window to send). If the option is None, then it indicates
     // a FIN. This keeps us from having to allocate an empty Demibuffer to indicate FIN.
-    unsent_queue: SharedAsyncQueue<DemiBuffer>,
+    pub unsent_queue: SharedAsyncQueue<DemiBuffer>,
 
     //
     // Receive Sequence Space:
@@ -273,18 +274,6 @@ impl OrderedDeliveryState {
         Ok(())
     }
 
-    pub async fn background_sender(
-        cb: &mut ControlBlock,
-        layer3_endpoint: &mut SharedLayer3Endpoint,
-        runtime: &mut SharedDemiRuntime,
-    ) -> Result<Never, Fail> {
-        loop {
-            // Get next bit of unsent data.
-            let buffer = cb.delivery.unsent_queue.pop(None).await?;
-            Self::send_buffer(cb, layer3_endpoint, runtime.now(), buffer).await?;
-        }
-    }
-
     fn send_fin(cb: &mut ControlBlock, layer3_endpoint: &mut SharedLayer3Endpoint, now: Instant) -> Result<(), Fail> {
         debug_assert!(cb.delivery.sender_fin_seq_no.is_some());
 
@@ -311,74 +300,32 @@ impl OrderedDeliveryState {
         Ok(())
     }
 
-    async fn send_buffer(
-        cb: &mut ControlBlock,
-        layer3_endpoint: &mut SharedLayer3Endpoint,
-        now: Instant,
-        mut buffer: DemiBuffer,
-    ) -> Result<(), Fail> {
-        let mut send_unacked_watched = cb.delivery.send_unacked.clone();
-        let mut cwnd_watched = cb.congestion_control.cc_algorithm.get_cwnd();
-
-        // The limited transmit algorithm may increase the effective size of cwnd by up to 2 * mss.
-        let mut ltci_watched = cb.congestion_control.cc_algorithm.get_limited_transmit_cwnd_increase();
-        let mut win_sz_watched = cb.flow_control.send_window.clone();
-
-        // Try in a loop until we send this segment.
-        loop {
-            // If we don't have any window size at all, we need to transition to PERSIST mode and
-            // repeatedly send window probes until window opens up.
-            if win_sz_watched.get() == 0 {
-                // Send a window probe (this is a one-byte packet designed to elicit a window update from our peer).
-                Self::send_window_probe(cb, layer3_endpoint, now, buffer.split_front(1)?).await?;
-            } else {
-                // TODO: Nagle's algorithm - We need to coalese small buffers together to send MSS sized packets.
-                // TODO: Silly window syndrome - See RFC 1122's discussion of the SWS avoidance algorithm.
-
-                // We have some window, try to send some or all of the segment.
-                let _ = cb.send_segment(layer3_endpoint, now, &mut buffer);
-                // If the buffer is now empty, then we sent all of it.
-                if buffer.is_empty() {
-                    return Ok(());
-                }
-                // Otherwise, wait until something limiting the window changes and then try again to finish sending
-                // the segment.
-                futures::select_biased! {
-                    _ = send_unacked_watched.wait_for_change(None).fuse() => (),
-                    _ = cb.delivery.send_next_seq_no.wait_for_change(None).fuse() => (),
-                    _ = win_sz_watched.wait_for_change(None).fuse() => (),
-                    _ = cwnd_watched.wait_for_change(None).fuse() => (),
-                    _ = ltci_watched.wait_for_change(None).fuse() => (),
-                };
-            }
-        }
-    }
-
-    async fn send_window_probe(
-        cb: &mut ControlBlock,
+    pub async fn send_window_probe(
+        &mut self,
+        flow_control: &FlowControlState,
+        connection_management: &ConnectionManagementState,
         layer3_endpoint: &mut SharedLayer3Endpoint,
         now: Instant,
         probe: DemiBuffer,
     ) -> Result<(), Fail> {
         // Update SND.NXT.
-        cb.delivery.send_next_seq_no.modify(|s| s + SeqNumber::from(1));
+        self.send_next_seq_no.modify(|s| s + SeqNumber::from(1));
 
         // Add the probe byte (as a new separate buffer) to our unacknowledged queue.
         let unacked_segment = UnackedSegment {
             bytes: Some(probe.clone()),
             initial_tx: Some(now),
         };
-        cb.delivery.unacked_queue.push(unacked_segment);
+        self.unacked_queue.push(unacked_segment);
 
         // Note that we loop here *forever*, exponentially backing off.
         // TODO: Use the correct PERSIST mode timer here.
         let mut timeout = Duration::from_secs(1);
-        let mut win_sz_watched = cb.flow_control.send_window.clone();
+        let mut win_sz_watched = flow_control.send_window.clone();
         loop {
             // Create packet.
-            let header = cb.delivery.tcp_header(&cb.connection_management, None);
-            cb.delivery
-                .emit(&cb.connection_management, layer3_endpoint, header, Some(probe.clone()));
+            let header = self.tcp_header(connection_management, None);
+            self.emit(connection_management, layer3_endpoint, header, Some(probe.clone()));
 
             match win_sz_watched.wait_for_change(Some(timeout)).await {
                 Ok(_) => return Ok(()),
@@ -389,6 +336,62 @@ impl OrderedDeliveryState {
                     )
                 },
             }
+        }
+    }
+
+    pub async fn rod_send_buffer(
+        &mut self,
+        flow_control: &mut FlowControlState,
+        connection_management: &mut ConnectionManagementState,
+        congestion_control: &mut CongestionControlState,
+        layer3_endpoint: &mut SharedLayer3Endpoint,
+        now: Instant,
+        buffer: &mut DemiBuffer,
+        cc_max_frame_size_bytes: usize,
+        send_unacked_watched: &mut SharedAsyncValue<SeqNumber>,
+        cwnd_watched: &mut SharedAsyncValue<u32>,
+        ltci_watched: &mut SharedAsyncValue<u32>,
+        win_sz_watched: &mut SharedAsyncValue<u32>,
+    ) -> Result<(), Fail> {
+        // If we have zero window, send a one-byte window probe and return.
+        if win_sz_watched.get() == 0 {
+            // split_front borrows/mutates `buffer`; we already have &mut buffer.
+            let probe = buffer.split_front(1)?;
+            self.send_window_probe(flow_control, connection_management, layer3_endpoint, now, probe)
+                .await?;
+            return Ok(());
+        } else {
+            // TODO: Nagle's algorithm - We need to coalese small buffers together to send MSS sized packets.
+            // TODO: Silly window syndrome - See RFC 1122's discussion of the SWS avoidance algorithm.
+            // We have some window, try to send some or all of the segment.
+            // NOTE: Following function modifies congestion control state, and then
+            // the ordered delivery state in that order. Modularity still holds since within the loop
+            // we will either only modify ROD state or we will modify CC, then ROD state.
+            let _ = self.transmit_segment(
+                connection_management,
+                congestion_control,
+                layer3_endpoint,
+                now,
+                buffer,
+                cc_max_frame_size_bytes,
+            );
+
+            // If the buffer is now empty, we successfully sent all of it.
+            if buffer.is_empty() {
+                return Ok(());
+            }
+
+            // Otherwise wait for any of the limiting conditions to change, and then try again to finish sending the segment.
+            futures::select_biased! {
+                _ = send_unacked_watched.wait_for_change(None).fuse() => (),
+                _ = self.send_next_seq_no.wait_for_change(None).fuse() => (),
+                _ = win_sz_watched.wait_for_change(None).fuse() => (),
+                _ = cwnd_watched.wait_for_change(None).fuse() => (),
+                _ = ltci_watched.wait_for_change(None).fuse() => (),
+            };
+
+            // After waking we return to caller so the outer loop can re-evaluate and call us again.
+            return Ok(());
         }
     }
 
