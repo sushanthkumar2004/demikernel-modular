@@ -19,7 +19,11 @@ use crate::{
             layer4::tcp::{
                 established::{
                     congestion_control::{self, CongestionControl},
-                    tcp_events::{build_control_block_for_passive_open, PassiveOpenConfig},
+                    ctrlblk::ControlBlock,
+                    tcp_events::{
+                        create_control_block_for_listen, dispatch_ack_in_synrcvd,
+                        dispatch_syn_in_listen, PassiveOpenConfig,
+                    },
                     SharedEstablishedSocket,
                 },
                 header::{TcpHeader, TcpOptions2},
@@ -250,6 +254,14 @@ impl SharedPassiveSocket {
         }
     }
 
+    /// Handles the passive open handshake using the modular component pattern.
+    /// 
+    /// Flow:
+    ///   1. Create ControlBlock in LISTEN state
+    ///   2. Process SYN via dispatch_syn_in_listen() -> LISTEN → SYN_RECEIVED  
+    ///   3. Send SYN+ACK
+    ///   4. Process ACK via dispatch_ack_in_synrcvd() -> SYN_RECEIVED → ESTABLISHED
+    ///   5. Create SharedEstablishedSocket from the fully-evolved ControlBlock
     async fn send_syn_ack_and_wait_for_ack(
         mut self,
         remote: SocketAddrV4,
@@ -258,7 +270,7 @@ impl SharedPassiveSocket {
         tcp_hdr: TcpHeader,
         recv_queue: SharedAsyncQueue<(Ipv4Addr, TcpHeader, DemiBuffer)>,
     ) {
-        // Set up new inflight accept connection.
+        // Parse SYN options
         let mut remote_window_scale = None;
         let mut mss = FALLBACK_MSS;
         for option in tcp_hdr.iter_options() {
@@ -275,35 +287,112 @@ impl SharedPassiveSocket {
             }
         }
 
+        // Calculate window scale values
+        let (local_window_scale_bits, remote_window_scale_bits): (u8, u8) = match remote_window_scale {
+            Some(remote_scale) => {
+                if (remote_scale as usize) > MAX_WINDOW_SCALE {
+                    warn!(
+                        "remote window scale larger than {:?} is incorrect, so setting to {:?}. See RFC 1323.",
+                        MAX_WINDOW_SCALE, MAX_WINDOW_SCALE
+                    );
+                    (self.tcp_config.get_window_scale(), MAX_WINDOW_SCALE as u8)
+                } else {
+                    (self.tcp_config.get_window_scale(), remote_scale)
+                }
+            },
+            None => (0, 0),
+        };
+
+        // Calculate local window size in bytes
+        debug_assert!((local_window_scale_bits as usize) <= MAX_WINDOW_SCALE);
+        let local_window_size_bytes: u32 = expect_some!(
+            (self.tcp_config.get_receive_window_size() as u32).checked_shl(local_window_scale_bits as u32),
+            "Window size overflow"
+        );
+
+        // ========================================================================
+        // STEP 1: Create ControlBlock in LISTEN state
+        // ========================================================================
+        let config = PassiveOpenConfig {
+            local: self.local,
+            tcp_config: self.tcp_config.clone(),
+            socket_options: self.socket_options,
+            local_isn,
+            ack_delay_timeout: self.tcp_config.get_ack_delay_timeout(),
+            local_window_size_bytes,
+            local_window_scale_bits,
+        };
+        let mut control_block = create_control_block_for_listen(config, congestion_control::None::new);
+
+        // ========================================================================
+        // STEP 2: Process SYN using dispatcher (LISTEN → SYN_RECEIVED)
+        // Each component updates its own state:
+        //   - delivery.on_syn_in_listen(): sets receive sequence numbers
+        //   - flow_control.on_syn_in_listen(): sets peer's window info
+        //   - conn_mgmt.on_syn_in_listen(): transitions to SYN_RECEIVED
+        // ========================================================================
+        dispatch_syn_in_listen(
+            &mut control_block,
+            &tcp_hdr,
+            remote,
+            local_isn,
+            mss,
+            remote_window_scale_bits,
+        );
+
+        // ========================================================================
+        // STEP 3: Send SYN+ACK and wait for ACK (with retries)
+        // ========================================================================
         let mut handshake_retries: usize = self.tcp_config.get_handshake_retries();
         let handshake_timeout: Duration = self.tcp_config.get_handshake_timeout();
 
         loop {
-            // Send the SYN + ACK.
+            // Send the SYN+ACK
             if let Err(e) = self.send_syn_ack(local_isn, remote_isn, remote).await {
                 self.complete_handshake(remote, Err(e));
                 return;
             }
 
-            // Start ack timer.
-
-            // Wait for ACK in response.
-            let ack = self.clone().wait_for_ack(
-                recv_queue.clone(),
-                remote,
+            // Wait for ACK in response
+            let ack_result = Self::wait_for_ack_packet(
+                &mut recv_queue.clone(),
                 local_isn,
                 remote_isn,
-                remote_window_scale,
-                mss,
             );
 
-            // Either we get an ack or a timeout.
-            match conditional_yield_with_timeout(ack, handshake_timeout).await {
-                // Got an ack
-                Ok(result) => {
+            // Either we get an ack or a timeout
+            match conditional_yield_with_timeout(ack_result, handshake_timeout).await {
+                // Got a valid ACK
+                Ok(Ok((ack_header, buf))) => {
+                    // ========================================================================
+                    // STEP 4: Process ACK using dispatcher (SYN_RECEIVED → ESTABLISHED)
+                    // Only conn_mgmt needs to update (state transition)
+                    // ========================================================================
+                    dispatch_ack_in_synrcvd(&mut control_block);
+
+                    // Check if there is data with the ACK
+                    let data_with_ack: Option<(TcpHeader, DemiBuffer)> = 
+                        if buf.is_empty() { None } else { Some((ack_header, buf)) };
+
+                    // ========================================================================
+                    // STEP 5: Create SharedEstablishedSocket from the evolved ControlBlock
+                    // ========================================================================
+                    let result = SharedEstablishedSocket::new_from_control_block(
+                        control_block,
+                        self.runtime.clone(),
+                        self.layer3_endpoint.clone(),
+                        data_with_ack,
+                    );
+
                     self.complete_handshake(remote, result);
                     return;
                 },
+                // Got an invalid ACK (protocol error)
+                Ok(Err(e)) => {
+                    self.complete_handshake(remote, Err(e));
+                    return;
+                },
+                // Timeout - retry if possible
                 Err(Fail { errno, cause: _ }) if errno == ETIMEDOUT => {
                     if handshake_retries > 0 {
                         handshake_retries -= 1;
@@ -314,10 +403,41 @@ impl SharedPassiveSocket {
                         return;
                     }
                 },
+                // Other error
                 Err(e) => {
                     self.complete_handshake(remote, Err(e));
                     return;
                 },
+            }
+        }
+    }
+
+    /// Wait for a valid ACK packet, returning the header and any data.
+    async fn wait_for_ack_packet(
+        recv_queue: &mut SharedAsyncQueue<(Ipv4Addr, TcpHeader, DemiBuffer)>,
+        local_isn: SeqNumber,
+        remote_isn: SeqNumber,
+    ) -> Result<(TcpHeader, DemiBuffer), Fail> {
+        loop {
+            match recv_queue.pop(None).await? {
+                // Valid ACK for our SYN+ACK
+                (_, tcp_hdr, buf) if tcp_hdr.ack && tcp_hdr.ack_num == local_isn + SeqNumber::from(1) => {
+                    debug!("Received ACK: {:?}", tcp_hdr);
+                    return Ok((tcp_hdr, buf));
+                },
+                // ACK with wrong sequence number
+                (_, tcp_hdr, _) if tcp_hdr.ack => {
+                    let cause = "invalid ACK seq num";
+                    warn!("{}: {:?}", cause, tcp_hdr);
+                    return Err(Fail::new(EBADMSG, cause));
+                },
+                // Duplicate SYN - ignore and keep waiting
+                (_, tcp_hdr, _) if tcp_hdr.syn && tcp_hdr.seq_num == remote_isn => {
+                    debug!("Received duplicate SYN: {:?}", tcp_hdr);
+                    continue;
+                },
+                // Unexpected packet
+                _ => return Err(Fail::new(EBADMSG, "must contain an ACK")),
             }
         }
     }
@@ -354,108 +474,6 @@ impl SharedPassiveSocket {
         self.layer3_endpoint
             .transmit_tcp_packet_blocking(dst_ipv4_addr, pkt)
             .await
-    }
-
-    async fn wait_for_ack(
-        self,
-        mut recv_queue: SharedAsyncQueue<(Ipv4Addr, TcpHeader, DemiBuffer)>,
-        remote: SocketAddrV4,
-        local_isn: SeqNumber,
-        remote_isn: SeqNumber,
-        remote_window_scale_bits: Option<u8>,
-        mss: usize,
-    ) -> Result<SharedEstablishedSocket, Fail> {
-        let (tcp_hdr, buf): (TcpHeader, DemiBuffer) = loop {
-            match recv_queue.pop(None).await? {
-                // We expect to get a SYN+ACK with the initial seq number plus 1.
-                (_, tcp_hdr, buf) if tcp_hdr.ack && tcp_hdr.ack_num == local_isn + SeqNumber::from(1) => {
-                    debug!("Received ACK: {:?}", tcp_hdr);
-                    break (tcp_hdr, buf);
-                },
-                // We got an ACK but not for the right sequence number.
-                (_, tcp_hdr, _) if tcp_hdr.ack => {
-                    let cause = "invalid SYN+ACK seq num";
-                    warn!("{}: {:?}", cause, tcp_hdr);
-                    return Err(Fail::new(EBADMSG, cause));
-                },
-                // We got a duplicate SYN, so ignore it.
-                (_, tcp_hdr, _) if tcp_hdr.syn && tcp_hdr.seq_num == remote_isn => {
-                    debug!("Received duplicate SYN: {:?}", tcp_hdr)
-                },
-                // We didn't get any kind of expected packet.
-                _ => return Err(Fail::new(EBADMSG, "must contain an ACK")),
-            }
-        };
-
-        // Calculate the window.
-        let (local_window_scale_bits, remote_window_scale_bits): (u8, u8) = match remote_window_scale_bits {
-            Some(remote_window_scale) => {
-                if (remote_window_scale as usize) > MAX_WINDOW_SCALE {
-                    warn!(
-                        "remote windows scale larger than {:?} is incorrect, so setting to {:?}. See RFC 1323.",
-                        MAX_WINDOW_SCALE, MAX_WINDOW_SCALE
-                    );
-                    (self.tcp_config.get_window_scale(), MAX_WINDOW_SCALE as u8)
-                } else {
-                    (self.tcp_config.get_window_scale(), remote_window_scale)
-                }
-            },
-            None => (0, 0),
-        };
-
-        // Expect is safe here because the window size is a 16-bit unsigned integer and MAX_WINDOW_SCALE is 14, so it is impossible to overflow the 32-bit
-        debug_assert!((remote_window_scale_bits as usize) <= MAX_WINDOW_SCALE);
-        let remote_window_size_bytes: u32 = expect_some!(
-            (tcp_hdr.window_size as u32).checked_shl(remote_window_scale_bits as u32),
-            "Window size overflow"
-        );
-        // Expect is safe here because the receive window size is a 16-bit unsigned integer and MAX_WINDOW_SCALE is 14,
-        // so it is impossible to overflow the 32-bit unsigned int.
-        debug_assert!((local_window_scale_bits as usize) <= MAX_WINDOW_SCALE);
-        let local_window_size_bytes: u32 = expect_some!(
-            (self.tcp_config.get_receive_window_size() as u32).checked_shl(local_window_scale_bits as u32),
-            "Window size overflow"
-        );
-        info!(
-            "Window sizes: local {} bytes, remote {} bytes",
-            local_window_size_bytes, remote_window_size_bytes
-        );
-        info!(
-            "Window scale: local {}, remote {}",
-            local_window_scale_bits, remote_window_scale_bits
-        );
-
-        // Check if there is data and if so, pass it along to the established header.
-        let data_with_ack: Option<(TcpHeader, DemiBuffer)> = if buf.is_empty() { None } else { Some((tcp_hdr, buf)) };
-        
-        // Build the ControlBlock using the component-based pattern.
-        // Each component is initialized with its own parameters - no "god function" knows all the internals.
-        let config = PassiveOpenConfig {
-            local: self.local,
-            remote,
-            local_isn,
-            remote_isn,
-            tcp_config: self.tcp_config.clone(),
-            socket_options: self.socket_options,
-            mss,
-            local_window_scale_bits,
-            remote_window_scale_bits,
-            local_window_size_bytes,
-            remote_window_size_bytes,
-            ack_delay_timeout: self.tcp_config.get_ack_delay_timeout(),
-        };
-        
-        let control_block = build_control_block_for_passive_open(config, congestion_control::None::new);
-        
-        // Create the socket from the pre-built ControlBlock
-        let new_socket: SharedEstablishedSocket = SharedEstablishedSocket::new_from_control_block(
-            control_block,
-            self.runtime.clone(),
-            self.layer3_endpoint.clone(),
-            data_with_ack,
-        )?;
-
-        Ok(new_socket)
     }
 
     fn complete_handshake(&mut self, remote: SocketAddrV4, result: Result<SharedEstablishedSocket, Fail>) {

@@ -16,7 +16,11 @@ use crate::{
             layer4::tcp::{
                 established::{
                     congestion_control::{self, CongestionControl},
-                    tcp_events::{build_control_block_for_active_open, ActiveOpenConfig},
+                    ctrlblk::ControlBlock,
+                    tcp_events::{
+                        create_control_block_for_syn_sent, dispatch_synack_in_synsent,
+                        ActiveOpenConfig,
+                    },
                     SharedEstablishedSocket,
                 },
                 header::{TcpHeader, TcpOptions2},
@@ -91,143 +95,47 @@ impl SharedActiveOpenSocket {
         })))
     }
 
-    fn process_ack(&mut self, header: TcpHeader) -> Result<SharedEstablishedSocket, Fail> {
-        let expected_seq: SeqNumber = self.local_isn + SeqNumber::from(1);
-
-        // Bail if we didn't receive a ACK packet with the right sequence number.
-        if !(header.ack && header.ack_num == expected_seq) {
-            let cause: String = format!(
-                "expected ack_num: {}, received ack_num: {}",
-                expected_seq, header.ack_num
-            );
-            error!("process_ack(): {}", cause);
-            return Err(Fail::new(libc::EAGAIN, &cause));
-        }
-
-        // Check if our peer is refusing our connection request.
-        if header.rst {
-            let cause: &'static str = "connection refused";
-            error!("process_ack(): {}", cause);
-            return Err(Fail::new(libc::ECONNREFUSED, cause));
-        }
-
-        // Bail if we didn't receive a SYN packet.
-        if !header.syn {
-            let cause: &'static str = "is not a syn packet";
-            error!("process_ack(): {}", cause);
-            return Err(Fail::new(libc::EAGAIN, cause));
-        }
-
-        debug!("Received SYN+ACK: {:?}", header);
-
-        let remote_seq_num = header.seq_num + SeqNumber::from(1);
-
-        let mut tcp_hdr = TcpHeader::new(self.local.port(), self.remote.port());
-        tcp_hdr.ack = true;
-        tcp_hdr.ack_num = remote_seq_num;
-        tcp_hdr.window_size = self.tcp_config.get_receive_window_size();
-        tcp_hdr.seq_num = self.local_isn + SeqNumber::from(1);
-        debug!("Sending ACK: {:?}", tcp_hdr);
-
-        let dst_ipv4_addr: Ipv4Addr = *self.remote.ip();
-        let mut pkt: DemiBuffer = DemiBuffer::new_with_headroom(0, MAX_HEADER_SIZE as u16);
-        tcp_hdr.serialize_and_attach(
-            &mut pkt,
-            self.local.ip(),
-            self.remote.ip(),
-            self.tcp_config.get_rx_checksum_offload(),
-        );
-        self.layer3_endpoint
-            .transmit_tcp_packet_nonblocking(dst_ipv4_addr, pkt)?;
-
-        let mut remote_window_scale_bits = None;
-        let mut mss = FALLBACK_MSS;
-        for option in header.iter_options() {
-            match option {
-                TcpOptions2::WindowScale(w) => {
-                    info!("Received window scale: {}", w);
-                    remote_window_scale_bits = Some(*w);
-                },
-                TcpOptions2::MaximumSegmentSize(m) => {
-                    info!("Received advertised MSS: {}", m);
-                    mss = *m as usize;
-                },
-                _ => continue,
-            }
-        }
-
-        let (local_window_scale_bits, remote_window_scale_bits): (u8, u8) = match remote_window_scale_bits {
-            Some(remote_window_scale_bits) => {
-                let remote: u8 = if remote_window_scale_bits as usize > MAX_WINDOW_SCALE {
-                    warn!(
-                        "remote windows scale larger than {:?} is incorrect, so setting to {:?}. See RFC 1323.",
-                        MAX_WINDOW_SCALE, MAX_WINDOW_SCALE
-                    );
-                    MAX_WINDOW_SCALE as u8
-                } else {
-                    remote_window_scale_bits
-                };
-                (self.tcp_config.get_window_scale(), remote)
-            },
-            None => (0, 0),
-        };
-
-        // Expect is safe here because the receive window size is a 16-bit unsigned integer and MAX_WINDOW_SCALE is 14,
-        // so it is impossible to overflow the 32-bit unsigned int.
-        debug_assert!((local_window_scale_bits as usize) <= MAX_WINDOW_SCALE);
-        let rx_window_size_bytes: u32 = expect_some!(
-            (self.tcp_config.get_receive_window_size() as u32).checked_shl(local_window_scale_bits as u32),
-            "Window size overflow"
-        );
-        // Expect is safe here because the window size is a 16-bit unsigned integer and MAX_WINDOW_SCALE is 14, so it is impossible to overflow the 32-bit
-        debug_assert!((remote_window_scale_bits as usize) <= MAX_WINDOW_SCALE);
-        let tx_window_size_bytes: u32 = expect_some!(
-            (header.window_size as u32).checked_shl(remote_window_scale_bits as u32),
-            "Window size overflow"
-        );
-
-        info!(
-            "Window sizes: local {} bytes, remote {} bytes",
-            rx_window_size_bytes, tx_window_size_bytes
-        );
-        info!(
-            "Window scale: local {}, remote {}",
-            local_window_scale_bits, remote_window_scale_bits
-        );
-
-        let config = ActiveOpenConfig {
-            local: self.local,
-            remote: self.remote,
-            local_isn: self.local_isn,
-            remote_isn: remote_seq_num - SeqNumber::from(1), // Original ISN
-            tcp_config: self.tcp_config.clone(),
-            socket_options: self.socket_options,
-            mss,
-            local_window_scale_bits,
-            remote_window_scale_bits,
-            local_window_size_bytes: rx_window_size_bytes,
-            remote_window_size_bytes: tx_window_size_bytes,
-            ack_delay_timeout: self.tcp_config.get_ack_delay_timeout(),
-        };
-
-        let control_block = build_control_block_for_active_open(config, congestion_control::None::new);
-
-        SharedEstablishedSocket::new_from_control_block(
-            control_block,
-            self.runtime.clone(),
-            self.layer3_endpoint.clone(),
-            None,
-        )
-    }
-
+    /// Active open handshake using the modular component pattern.
+    /// 
+    /// Flow:
+    ///   1. Create ControlBlock in SYN_SENT state
+    ///   2. Send SYN
+    ///   3. Wait for SYN+ACK
+    ///   4. Process via dispatch_synack_in_synsent() (SYN_SENT → ESTABLISHED)
+    ///   5. Send ACK
+    ///   6. Create SharedEstablishedSocket from the evolved ControlBlock
     pub async fn connect(mut self) -> Result<SharedEstablishedSocket, Fail> {
-        // Start connection handshake.
         let handshake_retries: usize = self.tcp_config.get_handshake_retries();
         let handshake_timeout = self.tcp_config.get_handshake_timeout();
 
-        // Try to connect.
+        // Calculate local window size
+        let local_window_scale_bits = self.tcp_config.get_window_scale();
+        debug_assert!((local_window_scale_bits as usize) <= MAX_WINDOW_SCALE);
+        let local_window_size_bytes: u32 = expect_some!(
+            (self.tcp_config.get_receive_window_size() as u32).checked_shl(local_window_scale_bits as u32),
+            "Window size overflow"
+        );
+
+        // ========================================================================
+        // STEP 1: Create ControlBlock in SYN_SENT state
+        // ========================================================================
+        let config = ActiveOpenConfig {
+            local: self.local,
+            remote: self.remote,
+            tcp_config: self.tcp_config.clone(),
+            socket_options: self.socket_options,
+            local_isn: self.local_isn,
+            ack_delay_timeout: self.tcp_config.get_ack_delay_timeout(),
+            local_window_size_bytes,
+            local_window_scale_bits,
+        };
+        let mut control_block = create_control_block_for_syn_sent(config, congestion_control::None::new);
+
+        // Try to connect with retries
         for _ in 0..handshake_retries {
-            // Set up SYN packet.
+            // ========================================================================
+            // STEP 2: Send SYN
+            // ========================================================================
             let mut tcp_hdr = TcpHeader::new(self.local.port(), self.remote.port());
             tcp_hdr.syn = true;
             tcp_hdr.seq_num = self.local_isn;
@@ -249,7 +157,7 @@ impl SharedActiveOpenSocket {
                 self.remote.ip(),
                 self.tcp_config.get_rx_checksum_offload(),
             );
-            // Send SYN.
+
             if let Err(e) = self
                 .layer3_endpoint
                 .transmit_tcp_packet_blocking(dst_ipv4_addr, pkt)
@@ -259,22 +167,127 @@ impl SharedActiveOpenSocket {
                 continue;
             }
 
-            // Wait for either a response or timeout.
+            // ========================================================================
+            // STEP 3: Wait for SYN+ACK
+            // ========================================================================
             let mut recv_queue: SharedAsyncQueue<(Ipv4Addr, TcpHeader, DemiBuffer)> = self.recv_queue.clone();
             let mut state: SharedAsyncValue<State> = self.state.clone();
+            
             select_biased! {
-            r = state.wait_for_change(None).fuse() => if let Ok(r) = r {
-                if r == State::Closed {
-                    let cause: &'static str = "Closing socket while connecting";
-                    warn!("{}", cause);
-                    return Err(Fail::new(libc::ECONNABORTED, cause));
-                }
-            },
-            r = recv_queue.pop(Some(handshake_timeout)).fuse() => match r {
-                Ok((_, header, _)) => match self.process_ack(header) {
-                        Ok(socket) => return Ok(socket),
-                        Err(Fail { errno, cause: _ }) if errno == libc::EAGAIN => continue,
-                        Err(e) => return Err(e),
+                r = state.wait_for_change(None).fuse() => if let Ok(r) = r {
+                    if r == State::Closed {
+                        let cause: &'static str = "Closing socket while connecting";
+                        warn!("{}", cause);
+                        return Err(Fail::new(libc::ECONNABORTED, cause));
+                    }
+                },
+                r = recv_queue.pop(Some(handshake_timeout)).fuse() => match r {
+                    Ok((_, header, _)) => {
+                        // Validate SYN+ACK
+                        let expected_seq: SeqNumber = self.local_isn + SeqNumber::from(1);
+                        
+                        if !(header.ack && header.ack_num == expected_seq) {
+                            let cause: String = format!(
+                                "expected ack_num: {}, received ack_num: {}",
+                                expected_seq, header.ack_num
+                            );
+                            error!("connect(): {}", cause);
+                            continue; // Retry
+                        }
+
+                        if header.rst {
+                            let cause: &'static str = "connection refused";
+                            error!("connect(): {}", cause);
+                            return Err(Fail::new(libc::ECONNREFUSED, cause));
+                        }
+
+                        if !header.syn {
+                            let cause: &'static str = "is not a syn packet";
+                            error!("connect(): {}", cause);
+                            continue; // Retry
+                        }
+
+                        debug!("Received SYN+ACK: {:?}", header);
+
+                        // Parse options
+                        let mut remote_window_scale: Option<u8> = None;
+                        let mut mss = FALLBACK_MSS;
+                        for option in header.iter_options() {
+                            match option {
+                                TcpOptions2::WindowScale(w) => {
+                                    info!("Received window scale: {}", w);
+                                    remote_window_scale = Some(*w);
+                                },
+                                TcpOptions2::MaximumSegmentSize(m) => {
+                                    info!("Received advertised MSS: {}", m);
+                                    mss = *m as usize;
+                                },
+                                _ => continue,
+                            }
+                        }
+
+                        let remote_window_scale_bits: u8 = match remote_window_scale {
+                            Some(scale) => {
+                                if scale as usize > MAX_WINDOW_SCALE {
+                                    warn!(
+                                        "remote window scale larger than {:?}, setting to {:?}. See RFC 1323.",
+                                        MAX_WINDOW_SCALE, MAX_WINDOW_SCALE
+                                    );
+                                    MAX_WINDOW_SCALE as u8
+                                } else {
+                                    scale
+                                }
+                            },
+                            None => 0,
+                        };
+
+                        // ========================================================================
+                        // STEP 4: Process SYN+ACK using dispatcher (SYN_SENT → ESTABLISHED)
+                        // Each component updates its own state:
+                        //   - delivery.on_synack_in_synsent(): sets receive sequence numbers
+                        //   - flow_control.on_synack_in_synsent(): sets peer's window info
+                        //   - conn_mgmt.on_synack_in_synsent(): transitions to ESTABLISHED
+                        // ========================================================================
+                        if let Err(e) = dispatch_synack_in_synsent(
+                            &mut control_block,
+                            &header,
+                            self.local_isn,
+                            remote_window_scale_bits,
+                            mss,
+                        ) {
+                            return Err(Fail::new(libc::EBADMSG, e));
+                        }
+
+                        // ========================================================================
+                        // STEP 5: Send ACK
+                        // ========================================================================
+                        let remote_seq_num = header.seq_num + SeqNumber::from(1);
+                        let mut ack_hdr = TcpHeader::new(self.local.port(), self.remote.port());
+                        ack_hdr.ack = true;
+                        ack_hdr.ack_num = remote_seq_num;
+                        ack_hdr.window_size = self.tcp_config.get_receive_window_size();
+                        ack_hdr.seq_num = self.local_isn + SeqNumber::from(1);
+                        debug!("Sending ACK: {:?}", ack_hdr);
+
+                        let mut ack_pkt: DemiBuffer = DemiBuffer::new_with_headroom(0, MAX_HEADER_SIZE as u16);
+                        ack_hdr.serialize_and_attach(
+                            &mut ack_pkt,
+                            self.local.ip(),
+                            self.remote.ip(),
+                            self.tcp_config.get_rx_checksum_offload(),
+                        );
+                        self.layer3_endpoint
+                            .transmit_tcp_packet_nonblocking(dst_ipv4_addr, ack_pkt)?;
+
+                        // ========================================================================
+                        // STEP 6: Create SharedEstablishedSocket from evolved ControlBlock
+                        // ========================================================================
+                        return SharedEstablishedSocket::new_from_control_block(
+                            control_block,
+                            self.runtime.clone(),
+                            self.layer3_endpoint.clone(),
+                            None,
+                        );
                     },
                     Err(Fail { errno, cause: _ }) if errno == libc::ETIMEDOUT => continue,
                     Err(_) => {

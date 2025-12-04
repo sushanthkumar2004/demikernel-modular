@@ -24,6 +24,8 @@ pub struct ConnectionManagementState {
 }
 
 impl ConnectionManagementState {
+    /// Create a new ConnectionManagementState in ESTABLISHED state.
+    /// Used when ControlBlock is created at the end of the handshake.
     pub fn new(
         local: SocketAddrV4,
         remote: SocketAddrV4,
@@ -36,6 +38,39 @@ impl ConnectionManagementState {
             tcp_config,
             socket_options,
             state: State::Established,
+        }
+    }
+
+    /// Create a new ConnectionManagementState in LISTEN state (passive open).
+    /// Used when ControlBlock is created at the start of the handshake.
+    pub fn new_listen(
+        local: SocketAddrV4,
+        tcp_config: TcpConfig,
+        socket_options: TcpSocketOptions,
+    ) -> Self {
+        Self {
+            local,
+            remote: SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+            tcp_config,
+            socket_options,
+            state: State::Listen,
+        }
+    }
+
+    /// Create a new ConnectionManagementState in SYN_SENT state (active open).
+    /// Used when ControlBlock is created at the start of the handshake.
+    pub fn new_syn_sent(
+        local: SocketAddrV4,
+        remote: SocketAddrV4,
+        tcp_config: TcpConfig,
+        socket_options: TcpSocketOptions,
+    ) -> Self {
+        Self {
+            local,
+            remote,
+            tcp_config,
+            socket_options,
+            state: State::SynSent,
         }
     }
 
