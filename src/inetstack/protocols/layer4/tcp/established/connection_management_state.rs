@@ -109,4 +109,34 @@ impl ConnectionManagementState {
             );
         }
     }
+
+    //======================================================================================================================
+    // Handshake State Transitions - Component Methods
+    //======================================================================================================================
+
+    /// Handle SYN received while in LISTEN state.
+    /// Transitions: LISTEN → SYN_RECEIVED
+    /// Only modifies: self.remote, self.state
+    pub fn on_syn_in_listen(&mut self, remote: SocketAddrV4) {
+        debug_assert_eq!(self.state, State::Listen, "on_syn_in_listen called in wrong state");
+        self.remote = remote;
+        self.state = State::SynReceived;
+    }
+
+    /// Handle SYN+ACK received while in SYN_SENT state (active open completion).
+    /// Transitions: SYN_SENT → ESTABLISHED
+    /// Only modifies: self.state
+    pub fn on_synack_in_synsent(&mut self) {
+        debug_assert_eq!(self.state, State::SynSent, "on_synack_in_synsent called in wrong state");
+        self.state = State::Established;
+    }
+
+    /// Handle ACK received while in SYN_RECEIVED state (passive open completion).
+    /// Transitions: SYN_RECEIVED → ESTABLISHED
+    /// Only modifies: self.state
+    pub fn on_ack_in_synrcvd(&mut self) {
+        debug_assert_eq!(self.state, State::SynReceived, "on_ack_in_synrcvd called in wrong state");
+        self.state = State::Established;
+    }
 }
+

@@ -19,6 +19,7 @@ use crate::{
             layer4::tcp::{
                 established::{
                     congestion_control::{self, CongestionControl},
+                    tcp_events::{build_control_block_for_passive_open, PassiveOpenConfig},
                     SharedEstablishedSocket,
                 },
                 header::{TcpHeader, TcpOptions2},
@@ -426,24 +427,32 @@ impl SharedPassiveSocket {
 
         // Check if there is data and if so, pass it along to the established header.
         let data_with_ack: Option<(TcpHeader, DemiBuffer)> = if buf.is_empty() { None } else { Some((tcp_hdr, buf)) };
-        let new_socket: SharedEstablishedSocket = SharedEstablishedSocket::new(
-            self.local,
+        
+        // Build the ControlBlock using the component-based pattern.
+        // Each component is initialized with its own parameters - no "god function" knows all the internals.
+        let config = PassiveOpenConfig {
+            local: self.local,
             remote,
+            local_isn,
+            remote_isn,
+            tcp_config: self.tcp_config.clone(),
+            socket_options: self.socket_options,
+            mss,
+            local_window_scale_bits,
+            remote_window_scale_bits,
+            local_window_size_bytes,
+            remote_window_size_bytes,
+            ack_delay_timeout: self.tcp_config.get_ack_delay_timeout(),
+        };
+        
+        let control_block = build_control_block_for_passive_open(config, congestion_control::None::new);
+        
+        // Create the socket from the pre-built ControlBlock
+        let new_socket: SharedEstablishedSocket = SharedEstablishedSocket::new_from_control_block(
+            control_block,
             self.runtime.clone(),
             self.layer3_endpoint.clone(),
             data_with_ack,
-            self.tcp_config.clone(),
-            self.socket_options,
-            remote_isn + SeqNumber::from(1),
-            self.tcp_config.get_ack_delay_timeout(),
-            local_window_size_bytes,
-            local_window_scale_bits,
-            local_isn + SeqNumber::from(1),
-            remote_window_size_bytes,
-            remote_window_scale_bits,
-            mss,
-            congestion_control::None::new,
-            None,
         )?;
 
         Ok(new_socket)

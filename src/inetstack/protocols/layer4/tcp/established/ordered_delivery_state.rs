@@ -185,7 +185,45 @@ impl OrderedDeliveryState {
     }
 
     //======================================================================================================================
+    // Handshake Component Methods
+    //======================================================================================================================
+
+    /// Handle SYN received while in LISTEN state.
+    /// Initializes receiver state with the remote's Initial Sequence Number (IRS).
+    /// Only modifies: receive_next_seq_no, reader_next_seq_no
+    pub fn on_syn_in_listen(&mut self, remote_isn: SeqNumber) {
+        // The first byte we expect to receive is IRS + 1 (after the SYN)
+        let first_data_seq = remote_isn + SeqNumber::from(1);
+        self.receive_next_seq_no = first_data_seq;
+        self.reader_next_seq_no = first_data_seq;
+    }
+
+    /// Handle SYN+ACK received while in SYN_SENT state (active open).
+    /// Validates the ACK and stores the remote's Initial Sequence Number.
+    /// Only modifies: receive_next_seq_no, reader_next_seq_no
+    /// Returns: The remote's first data sequence number (IRS + 1)
+    pub fn on_synack_in_synsent(
+        &mut self,
+        remote_isn: SeqNumber,
+        local_isn: SeqNumber,
+        ack_num: SeqNumber,
+    ) -> Result<(), &'static str> {
+        // Validate: ACK must acknowledge our SYN (local_isn + 1)
+        let expected_ack = local_isn + SeqNumber::from(1);
+        if ack_num != expected_ack {
+            return Err("SYN+ACK does not acknowledge our SYN");
+        }
+
+        // Store the remote's sequence number
+        let first_data_seq = remote_isn + SeqNumber::from(1);
+        self.receive_next_seq_no = first_data_seq;
+        self.reader_next_seq_no = first_data_seq;
+        Ok(())
+    }
+
+    //======================================================================================================================
     // Sender methods
+
     //======================================================================================================================
 
     fn process_acked_segment(&mut self, bytes_remaining: usize, mut segment: UnackedSegment) -> usize {

@@ -28,11 +28,14 @@ use crate::{
 // Structures
 //======================================================================================================================
 
-/// TCP Connection State.
-/// Note: This ControlBlock structure is only used after we've reached the ESTABLISHED state, so states LISTEN,
-/// SYN_RCVD, and SYN_SENT aren't included here.
+
+/// TCP Connection State - Complete TCP state machine (RFC 793).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum State {
+    Closed,
+    Listen,
+    SynSent,
+    SynReceived,
     Established,
     FinWait1,
     FinWait2,
@@ -40,8 +43,8 @@ pub enum State {
     TimeWait,
     CloseWait,
     LastAck,
-    Closed,
 }
+
 
 /// Transmission control block for representing our TCP connection.
 /// This struct has only public members because includes state for both the send and receive path and is accessed by

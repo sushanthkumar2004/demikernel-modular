@@ -55,6 +55,44 @@ impl FlowControlState {
             );
         }
     }
+
+    //======================================================================================================================
+    // Handshake Component Methods
+    //======================================================================================================================
+
+    /// Handle SYN received while in LISTEN state.
+    /// Stores the peer's advertised window from the SYN.
+    /// Only modifies: send_window, send_window_last_update_seq/ack, mss
+    pub fn on_syn_in_listen(
+        &mut self,
+        header: &TcpHeader,
+        remote_isn: SeqNumber,
+        local_isn: SeqNumber,
+        mss: usize,
+        window_scale_bits: u8,
+    ) {
+        self.send_window_scale_shift_bits = window_scale_bits;
+        self.send_window.set((header.window_size as u32) << window_scale_bits);
+        self.send_window_last_update_seq = remote_isn;
+        self.send_window_last_update_ack = local_isn;
+        self.mss = mss;
+    }
+
+    /// Handle SYN+ACK received while in SYN_SENT state (active open).
+    /// Updates window from the SYN+ACK.
+    /// Only modifies: send_window, send_window_last_update_seq/ack, send_window_scale_shift_bits, mss
+    pub fn on_synack_in_synsent(
+        &mut self,
+        header: &TcpHeader,
+        window_scale_bits: u8,
+        mss: usize,
+    ) {
+        self.send_window_scale_shift_bits = window_scale_bits;
+        self.send_window.set((header.window_size as u32) << window_scale_bits);
+        self.send_window_last_update_seq = header.seq_num;
+        self.send_window_last_update_ack = header.ack_num;
+        self.mss = mss;
+    }
 }
 
 impl fmt::Debug for FlowControlState {

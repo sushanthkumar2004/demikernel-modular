@@ -6,12 +6,13 @@
 //======================================================================================================================
 
 pub mod congestion_control;
-mod congestion_control_state;
-mod connection_management_state;
+pub mod congestion_control_state;
+pub mod connection_management_state;
 pub mod ctrlblk;
-mod flow_control_state;
-mod ordered_delivery_state;
+pub mod flow_control_state;
+pub mod ordered_delivery_state;
 mod rto;
+pub mod tcp_events;
 
 //======================================================================================================================
 // Imports
@@ -173,6 +174,34 @@ impl SharedEstablishedSocket {
         if let Some((header, data)) = data_from_ack {
             me.receive(header, data);
         }
+        let me2 = me.clone();
+        runtime.schedule_coroutine(
+            "bgc::inetstack::tcp::established::background",
+            Box::pin(async move { me2.background().await }.fuse()),
+        )?;
+        Ok(me)
+    }
+
+    /// Create a new established socket from a pre-built ControlBlock.
+    /// This supports the component-based architecture where the ControlBlock
+    /// is constructed incrementally during the handshake using dispatchers.
+    pub fn new_from_control_block(
+        control_block: ControlBlock,
+        mut runtime: SharedDemiRuntime,
+        layer3_endpoint: SharedLayer3Endpoint,
+        data_from_ack: Option<(TcpHeader, DemiBuffer)>,
+    ) -> Result<Self, Fail> {
+        let mut me = Self(SharedObject::new(EstablishedSocket {
+            control_block,
+            runtime: runtime.clone(),
+            layer3_endpoint,
+        }));
+
+        // Process data carried with the response to the SYN+ACK
+        if let Some((header, data)) = data_from_ack {
+            me.receive(header, data);
+        }
+
         let me2 = me.clone();
         runtime.schedule_coroutine(
             "bgc::inetstack::tcp::established::background",
