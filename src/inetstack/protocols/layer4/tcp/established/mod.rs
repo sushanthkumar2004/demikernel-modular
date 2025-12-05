@@ -292,29 +292,28 @@ impl SharedEstablishedSocket {
 
         let mut me2 = self.clone();
         let retransmitter_cc = async_timer!("tcp::established::background::retransmitter_cc", async {
-            let mut layer3_endpoint = me2.layer3_endpoint.clone();
-            let mut runtime = me2.runtime.clone();
-            CongestionControlState::background_retransmitter_cc(&mut me2.control_block, &mut layer3_endpoint, &mut runtime)
+            CongestionControlState::background_retransmitter_cc(&mut me2.control_block)
                 .await
         })
         .fuse();
         pin_mut!(retransmitter_cc);
 
+        let mut me3 = self.clone();
         let retransmitter_rod = async_timer!("tcp::established::background::retransmitter_rod", async {
-            let mut layer3_endpoint = me2.layer3_endpoint.clone();
-            let mut runtime = me2.runtime.clone();
-            OrderedDeliveryState::background_retransmitter_rod(&mut me2.control_block, &mut layer3_endpoint, &mut runtime)
+            let mut layer3_endpoint = me3.layer3_endpoint.clone();
+            let mut runtime = me3.runtime.clone();
+            OrderedDeliveryState::background_retransmitter_rod(&mut me3.control_block, &mut layer3_endpoint, &mut runtime)
                 .await
             
         })
         .fuse();
         pin_mut!(retransmitter_rod);
 
-        let mut me3 = self.clone();
+        let mut me4 = self.clone();
         let sender = async_timer!("tcp::established::background::sender", async {
-            let mut layer3_endpoint = me3.layer3_endpoint.clone();
-            let mut runtime = me3.runtime.clone();
-            OrderedDeliveryState::background_sender(&mut me3.control_block, &mut layer3_endpoint, &mut runtime).await
+            let mut layer3_endpoint = me4.layer3_endpoint.clone();
+            let mut runtime = me4.runtime.clone();
+            OrderedDeliveryState::background_sender(&mut me4.control_block, &mut layer3_endpoint, &mut runtime).await
         })
         .fuse();
         pin_mut!(sender);

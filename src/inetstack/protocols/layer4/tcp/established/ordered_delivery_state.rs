@@ -89,7 +89,7 @@ pub struct OrderedDeliveryState {
     // Send timers
     // Current retransmission timer expiration time.
     // TODO: Consider storing this directly in the RtoCalculator.
-    retransmit_deadline_time_secs: SharedAsyncValue<Option<Instant>>,
+    pub retransmit_deadline_time_secs: SharedAsyncValue<Option<Instant>>,
 
     // In RFC 793 terms, this is SND.NXT.
     pub send_next_seq_no: SharedAsyncValue<SeqNumber>,
